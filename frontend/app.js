@@ -14,7 +14,9 @@ async function api(path, method = 'GET', body) {
   const result = await response.json();
   if (!response.ok) {
     const detail = result.detail;
-    throw new Error(Array.isArray(detail) ? '请核对题目、来源位置和输入长度。' : detail || result.error?.message || '请求失败');
+    const error = new Error(Array.isArray(detail) ? '请核对题目、来源位置和输入长度。' : detail || result.error?.message || '请求失败');
+    error.status = response.status;
+    throw error;
   }
   return result;
 }
@@ -41,7 +43,7 @@ function readFields(node) {
 }
 async function refresh() {
   [documents, questions] = await Promise.all([api('/documents'),api('/questions?q='+encodeURIComponent($('#filter').elements.q.value))]);
-  $('#docs-list').innerHTML = documents.map(d => `<article class="row"><div><h3>${esc(d.filename)}</h3><small>原件已保存，自动拆题待接入</small></div>
+  $('#docs-list').innerHTML = documents.map(d => `<article class="row"><div><h3>${esc(d.filename)}</h3><small>${d.questions_llm_confirmed ? '题目已确认' : '原件已保存'}</small></div>
     <div class="actions"><a target="_blank" rel="noopener" href="/api/documents/${encodeURIComponent(d.id)}/content">查看原文</a>
     ${button('整理草稿','draft',d.id)}${button('删除文档','remove-doc',d.id)}</div></article>`).join('') || '<p>暂无文档。</p>';
   $('#question-list').innerHTML = questions.map(q => {
@@ -52,8 +54,12 @@ async function refresh() {
       <div class="actions">${button('编辑','edit',q.question_id)}${button('删除题目','remove-question',q.question_id)}</div></article>`;
   }).join('') || '<p>没有符合条件的已确认题目。</p>';
 }
-function draftForm(items) {
-  dialog(`<h2>整理题目草稿</h2><p>${esc(edit.filename)} · 请按原文填写，核对后再确认。</p><form id="draft-form">
+function questionPreview(items) {
+  return items.map((q, i) => `<article><h3>${i + 1}. ${esc(q.question)}</h3>
+    <p class="prose">${esc(q.answer || '无参考答案')}</p><small>${esc(q.tags.join(' · '))} ${esc(q.locator)}</small></article>`).join('');
+}
+function draftForm(items, note = '请按原文填写，核对后再确认。') {
+  dialog(`<h2>整理题目草稿</h2><p>${esc(edit.filename)} · ${esc(note)}</p><form id="draft-form">
     <div id="drafts" style="width:100%">${items.map(fields).join('')}</div>${button('再加一道','more')}<button>预览草稿</button></form>`);
 }
 $('#upload').onclick = () => $('#file').click();
@@ -64,7 +70,7 @@ $('#file').onchange = async event => {
     if (file.size>16*1024*1024) throw new Error('单份 Markdown 原件不能超过 16 MiB');
     const body=new FormData(); body.append('file',file);
     const doc=await api('/documents','POST',body); await refresh();
-    status(doc.reused?'已复用相同原件，自动拆题待接入。':'原件已保存，自动拆题待接入。');
+    status(doc.reused ? '已复用相同原件。' : '原件已保存。');
   } catch(e){status(e.message,true)} finally{$('#upload').disabled=false}
 };
 $('#add').onclick = () => {edit={}; dialog('<h2>手动添加题目</h2><form id="question-form">'+fields()+'<button>保存题目</button></form>')};
@@ -73,7 +79,25 @@ document.addEventListener('click',async event=>{
   const b=event.target.closest('[data-action]'); if(!b || b.disabled)return;
   const {action,id}=b.dataset; b.disabled=true;
   try {
-    if(action==='draft'){edit=documents.find(d=>d.id===id); draftForm([{}])}
+    if (action === 'draft') {
+      const doc = documents.find(d => d.id === id);
+      edit = doc;
+      dialog('<h2>整理草稿</h2><p>正在读取文档题目…</p>');
+      try {
+        const result = await api('/documents/' + encodeURIComponent(id) + '/prepare', 'POST');
+        if (edit !== doc || !$('#editor').open) return;
+        if (result.status === 'confirmed') {
+          dialog(`<h2>已确认题目</h2><p>${esc(doc.filename)} · ${result.questions.length} 道</p>` +
+            questionPreview(result.questions));
+        } else {
+          draftForm(result.questions.length ? result.questions : [{}]);
+        }
+      } catch (error) {
+        if (edit !== doc || !$('#editor').open) return;
+        if (error.status !== 501) throw error;
+        draftForm([{}], '自动拆题待接入，可手动整理后确认。');
+      }
+    }
     if(action==='more')$('#drafts').insertAdjacentHTML('beforeend',fields());
     if(action==='back')draftForm(edit.drafts);
     if(action==='confirm'){
@@ -106,7 +130,7 @@ document.addEventListener('submit',async event=>{
     if(form.id==='draft-form'){
       edit.drafts=[...form.querySelectorAll('fieldset')].map(readFields);
       if(edit.drafts.some(d=>!d.question))throw new Error('请填写每道题的题干。');
-      dialog('<h2>核对题目草稿</h2>'+edit.drafts.map((d,i)=>`<article><h3>${i+1}. ${esc(d.question)}</h3><p class="prose">${esc(d.answer || '无参考答案')}</p><small>${esc(d.tags.join(' · '))} ${esc(d.locator)}</small></article>`).join('')+
+      dialog('<h2>核对题目草稿</h2>'+questionPreview(edit.drafts)+
         button('返回编辑','back')+button('确认入库','confirm',edit.id));
     }
     if(form.id==='search-form'){

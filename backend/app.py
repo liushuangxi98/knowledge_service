@@ -66,6 +66,10 @@ def create_app(settings=None):
         library.remove_document(key)
         return Response(status_code=204)
 
+    @app.post('/api/documents/{key}/prepare')
+    def prepare(key: str):
+        return library.prepare(key)
+
     @app.post('/api/documents/{key}/confirm')
     def confirm(key: str, body: Drafts):
         return library.confirm(key, body.questions)

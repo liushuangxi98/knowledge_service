@@ -7,11 +7,15 @@ from fastapi import HTTPException
 from sqlalchemy import select
 from sqlalchemy.dialects.mysql import insert
 
+from knowledge_agent import parse_questions
 from .database import Document, Question
+from .schemas import QuestionInput
 
 
 def show_document(doc):
-    return {'id': doc.id, 'filename': doc.filename, 'created_at': doc.created_at, 'parse_status': 'not_connected'}
+    return {'id': doc.id, 'filename': doc.filename, 'created_at': doc.created_at,
+            'questions_llm_confirmed': doc.questions_llm_confirmed,
+            'parse_status': 'ready' if callable(getattr(parse_questions, 'parse_questions', None)) else 'not_connected'}
 
 
 def show_question(item):
@@ -93,9 +97,29 @@ class Library:
         with self.sessions() as session:
             return [show_question(item) for item in session.scalars(stmt.order_by(Question.question_id))]
 
+    def prepare(self, key):
+        """已确认的文档直接读正式题目；只有未确认的文档才需要拆题。"""
+        with self.sessions() as session:
+            doc = get_record(session, Document, key)
+            if doc.questions_llm_confirmed:
+                rows = session.scalars(select(Question).where(Question.document_id == key).order_by(Question.question_id))
+                return {'status': 'confirmed', 'questions': [show_question(row) for row in rows]}
+
+        parser = getattr(parse_questions, 'parse_questions', None)
+        if parser is None:
+            raise HTTPException(501, '自动拆题待接入')
+        source = self.original(key).decode('utf-8-sig')
+        drafts = parser(key, source)
+        return {'status': 'draft', 'questions': [QuestionInput.model_validate(item).model_dump() for item in drafts]}
+
     def confirm(self, key, drafts):
         with self.sessions.begin() as session:
-            get_record(session, Document, key, lock=True)
+            doc = get_record(session, Document, key, lock=True)
+            if doc.questions_llm_confirmed:
+                # 另一标签页可能已提交了同一文档，旧草稿不会再写入。
+                ids = session.scalars(select(Question.question_id).where(Question.document_id == key)
+                                      .order_by(Question.question_id)).all()
+                return {'question_ids': ids}
             ids = []
             for draft in drafts:
                 # 来源文档、原文位置和题干决定是否为同一题。重复确认保留人工编辑和索引状态。
@@ -107,7 +131,9 @@ class Library:
                     session.add(item)
                     session.flush()
                 ids.append(item.question_id)
-            return {'question_ids': list(dict.fromkeys(ids))}
+            # 与题目写入一起提交。只生成草稿、或事务失败时均不标记为已确认。
+            doc.questions_llm_confirmed = True
+            return {'question_ids': sorted(set(ids))}
 
     def save_question(self, data, key=None):
         with self.sessions.begin() as session:

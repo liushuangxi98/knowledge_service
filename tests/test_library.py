@@ -57,16 +57,16 @@ def test_document_confirm_and_index_state(library):
     assert len(set(ids)) == 2
     saved, = client.get('/api/questions', params={'q': '什么是检索', 'document_id': key}).json()
     assert saved['document_id'] == key and saved['answer'] == '' and saved['locator'] == '第一章'
-    assert saved['question_id'] == ids[0] and saved['index_status'] == 'pending'
+    assert saved['question_id'] in ids and saved['index_status'] == 'pending'
 
     # 模拟将来索引器的成功写回，以验证修改参考答案和修改题干的差异。
     engine = make_engine(settings)
     with Session(engine) as session, session.begin():
-        session.get(Question, ids[0]).index_status = 'indexed'
+        session.get(Question, saved['question_id']).index_status = 'indexed'
     engine.dispose()
     edit = {**drafts['questions'][0], 'answer': '已核对的答案'}
-    assert client.put('/api/questions/'+ids[0], json=edit).json()['index_status'] == 'indexed'
-    changed = client.put('/api/questions/'+ids[0], json={**edit, 'question': '如何做检索？'}).json()
+    assert client.put('/api/questions/'+saved['question_id'], json=edit).json()['index_status'] == 'indexed'
+    changed = client.put('/api/questions/'+saved['question_id'], json={**edit, 'question': '如何做检索？'}).json()
     assert changed['index_status'] == 'pending'
     assert client.post(url, json=drafts).json()['question_ids'] == ids
     assert client.get('/api/questions', params={'q': '如何做检索'}).json() == [changed]
@@ -94,3 +94,62 @@ def test_agent_modules_contain_only_their_docstrings():
     for path in (ROOT / 'knowledge_agent').glob('*.py'):
         module = ast.parse(path.read_text(encoding='utf-8'))
         assert len(module.body) == 1 and ast.get_docstring(module)
+
+def test_prepare_reuses_confirmed_questions_after_restart(library, monkeypatch):
+    from unittest.mock import Mock
+    from knowledge_agent import parse_questions
+
+    client, settings = library
+    key = upload(client, '面试.md', '# 面试'.encode()).json()['id']
+    url = f'/api/documents/{key}'
+    drafts = [{'question': f'题目 {i}'} for i in range(5)]
+    parser = Mock(return_value=drafts)
+    monkeypatch.setattr(parse_questions, 'parse_questions', parser, raising=False)
+    prepared = client.post(url + '/prepare').json()
+    assert prepared['status'] == 'draft' and len(prepared['questions']) == 5
+    parser.assert_called_once_with(key, '# 面试')
+    assert client.get('/api/documents').json()[0]['questions_llm_confirmed'] is False
+    ids = client.post(url + '/confirm', json={'questions': drafts}).json()['question_ids']
+    with TestClient(create_app(settings)) as reopened:
+        assert reopened.get('/api/documents').json()[0]['questions_llm_confirmed'] is True
+        assert upload(reopened, '同一份.md', '# 面试'.encode()).json()['questions_llm_confirmed'] is True
+        data = reopened.post(url + '/prepare').json()
+        assert data['status'] == 'confirmed'
+        assert {q['question_id'] for q in data['questions']} == set(ids)
+        assert all(q['index_status'] == 'pending' for q in data['questions'])
+        stale = reopened.post(url + '/confirm', json={'questions': [{'question': '另一版措辞'}]})
+        assert set(stale.json()['question_ids']) == set(ids)
+        for qid in ids:
+            assert reopened.delete('/api/questions/' + qid).status_code == 204
+        assert reopened.post(url + '/prepare').json() == {'status': 'confirmed', 'questions': []}
+    parser.assert_called_once()
+
+
+def test_upgrade_backfills_old_confirmations(library):
+    client, settings = library
+    key = upload(client, '旧文档.md', b'# old').json()['id']
+    new = upload(client, '未整理.md', b'# new').json()['id']
+    client.post(f'/api/documents/{key}/confirm', json={'questions': [{'question': '原题'}]}).raise_for_status()
+    engine = make_engine(settings)
+    with engine.begin() as conn:
+        conn.execute(text('ALTER TABLE documents DROP COLUMN questions_llm_confirmed'))
+    engine.dispose()
+    initialize(settings)
+    initialize(settings)
+    flags = {doc['id']: doc['questions_llm_confirmed'] for doc in client.get('/api/documents').json()}
+    assert flags == {key: True, new: False}
+    assert client.post(f'/api/documents/{new}/prepare').status_code == 501
+
+
+def test_failed_confirm_rolls_back_flag_and_questions(library, monkeypatch):
+    from sqlalchemy.exc import SQLAlchemyError
+    client, _ = library
+    key = upload(client, '题库.md', b'# test').json()['id']
+    def fail_commit(*args):
+        raise SQLAlchemyError('test')
+    with monkeypatch.context() as failure:
+        failure.setattr('sqlalchemy.orm.session.SessionTransaction.commit', fail_commit)
+        result = client.post(f'/api/documents/{key}/confirm', json={'questions': [{'question':'测试题'}]})
+    assert result.status_code == 503
+    assert client.get('/api/documents').json()[0]['questions_llm_confirmed'] is False
+    assert client.get('/api/questions').json() == []
