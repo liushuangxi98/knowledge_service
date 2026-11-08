@@ -10,7 +10,7 @@ from sqlalchemy.orm import sessionmaker
 from .config import Settings, ROOT
 from .database import make_engine
 from .middleware import BodyLimitMiddleware
-from .schemas import Drafts, QuestionInput, SearchInput
+from .schemas import QuestionDrafts, QuestionInput, SearchInput
 from .service import Library
 
 
@@ -71,7 +71,7 @@ def create_app(settings=None):
         return library.prepare(key)
 
     @app.post('/api/documents/{key}/confirm')
-    def confirm(key: str, body: Drafts):
+    def confirm(key: str, body: QuestionDrafts):
         return library.confirm(key, body.questions)
 
     @app.get('/api/questions')

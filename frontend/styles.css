@@ -1,1 +1,64 @@
 *{box-sizing:border-box}body{margin:0;background:#f4f6f3;color:#20382c;font:15px/1.65 "Microsoft YaHei",system-ui,sans-serif}.top{background:#173b30;color:white;padding:24px max(5vw,24px);display:flex;align-items:center;justify-content:space-between;gap:16px;flex-wrap:wrap}.top h1{margin:0;font-size:25px}.top nav{display:flex;gap:20px;flex-wrap:wrap}.top a{color:#e6f4eb}a{color:#216449}main{max-width:1050px;margin:38px auto;padding:0 20px}section,dialog{background:white;border:1px solid #d8e4da;border-radius:12px;padding:24px;margin-bottom:24px}h2,h3,p{margin:0 0 8px}h2{font-size:21px}h3{font-size:16px}p,small{color:#516655}.heading,.row,.actions,form{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap}.heading{margin-bottom:16px}.row{border-top:1px solid #e4eae4;padding:15px 0;overflow-wrap:anywhere}.row>div:first-child{flex:1;min-width:170px}.actions{justify-content:flex-start}button,input,textarea{font:inherit}button{background:#246345;color:white;border:1px solid transparent;padding:7px 14px;border-radius:6px;cursor:pointer}.light{background:white;border-color:#c6d8ca;color:#254c35}button:disabled{opacity:.5}form{justify-content:flex-start;margin:12px 0}input,textarea{border:1px solid #b9cdbf;border-radius:5px;padding:8px;color:inherit;max-width:100%}input[type=number]{width:5em}#filter input{width:300px}dialog{max-width:min(680px,94vw);width:650px;max-height:88vh;margin:auto}dialog::backdrop{background:#172b2360}.fields{display:grid;gap:8px;width:100%;border:0;border-bottom:1px solid #d8e4da;padding:0 0 16px;margin-bottom:12px}.fields label{display:grid;gap:3px}textarea{width:100%;resize:vertical}.note,#status{background:#e6f1e8;padding:10px 14px;border-radius:6px}.error,#dialog-error{color:#912e25}pre,.prose{white-space:pre-wrap;overflow-wrap:anywhere;font:inherit}summary{cursor:pointer}dialog button{margin:5px 4px 5px 0}button:focus-visible,a:focus-visible,input:focus-visible,textarea:focus-visible{outline:3px solid #66a57c;outline-offset:2px}@media(max-width:560px){main{padding:0 12px;margin:18px auto}section{padding:16px}.top{padding:16px}.row{align-items:flex-start}}
+
+/* 长题库在列表内滚动，排序和预览按钮保持可见。 */
+.draft-tools { width:100%; display:flex; justify-content:space-between; align-items:center; gap:12px }
+.draft-tools select { font:inherit; padding:4px 8px; border:1px solid #b9cdbf; border-radius:5px; color:inherit; background:white }
+.draft-list { width:100%; max-height:48vh; overflow:auto; border:1px solid #d8e4da; border-radius:8px }
+.draft-row + .draft-row { border-top:1px solid #e2e9e3 }
+.draft-row summary { display:flex; align-items:baseline; gap:10px; padding:9px 12px; line-height:1.5 }
+.draft-row summary:hover, .draft-row[open] > summary { background:#eff5f0 }
+.draft-row summary::after { content:'▸'; margin-left:auto; color:#526c5d }
+.draft-row[open] > summary::after { content:'▾' }
+.draft-number { color:#37664e; font-size:.85em; font-variant-numeric:tabular-nums; min-width:2ch }
+.draft-title { white-space:pre-wrap; overflow-wrap:anywhere; min-width:0 }
+.draft-body { padding:10px 14px 14px; overflow-wrap:anywhere }
+.draft-body .fields { margin:0; padding:0; border:0; min-width:0 }
+/* 让浏览器按实际文字排版撑开编辑框，包括预填内容、换行和窗口变窄。 */
+#editor .fields textarea { field-sizing:content; width:100%; min-width:0; min-height:2em; font-size:13px; line-height:1.4; padding:4px 7px; overflow-wrap:anywhere; resize:vertical }
+#editor .fields label { min-width:0 }
+.draft-moves { margin-top:8px }
+.draft-row:first-child [data-action=up], .draft-row:last-child [data-action=down] { display:none }
+
+/* 编辑侧重快速改题；预览用题目目录和单题阅读区。 */
+#editor:has(.draft-workspace) { width:min(940px,94vw); max-width:94vw; padding:0; border:0; border-radius:15px; box-shadow:0 20px 70px #102b233b; background:#f7f8f4 }
+.draft-workspace { --edge:#d7e0d5; color:#1e332a }
+.draft-head { padding:22px 86px 18px 26px; border-top:4px solid #46765b; background:white; border-bottom:1px solid var(--edge) }
+.draft-head h2 { margin:0; font-size:22px; line-height:1.35 }
+.draft-head p { margin:5px 0 0; color:#617266; font-size:13px; overflow-wrap:anywhere }
+#editor:has(.draft-workspace) #close { position:absolute; right:18px; top:16px; margin:0; font-size:13px; padding:4px 11px }
+#editor:has(.draft-workspace) #dialog-error:not([hidden]), .draft-note { padding:8px 24px; margin:0 }
+#draft-form { display:block; margin:0 }
+.draft-tools { padding:12px 24px; font-size:14px }
+#draft-form .draft-list { width:auto; margin:0 24px 16px; background:white; max-height:48vh }
+.draft-row summary { padding:10px 16px; align-items:center; font-weight:500 }
+.draft-number { background:#edf2ec; border-radius:4px; padding:1px 5px; min-width:28px; text-align:center; flex:none }
+.draft-row[open] > summary { background:#e5eee4; color:#194d36 }
+.draft-row[open] .draft-number { background:#2e6045; color:white }
+.draft-body { padding:14px 18px }
+.draft-body .fields { grid-template-columns:repeat(2,minmax(0,1fr)); gap:6px 12px }
+.draft-body .fields label { color:#435d4c; font-size:13px }
+.draft-body .fields label:nth-child(-n+2) { grid-column:1/-1 }
+.draft-moves button { font-size:13px; padding:3px 10px }
+.draft-footer { display:flex; justify-content:space-between; padding:12px 24px; border-top:1px solid var(--edge); background:white }
+.draft-footer button { margin:0 }
+.review-layout { display:grid; grid-template-columns:minmax(190px,33%) minmax(0,1fr); margin:18px 24px; border:1px solid var(--edge); border-radius:9px; overflow:hidden; background:white }
+#review-list, #review-reading { overflow:auto; max-height:50vh; min-width:0 }
+#review-list { display:flex; flex-direction:column; gap:2px; background:#f0f3ed; padding:8px; border-right:1px solid var(--edge) }
+#review-list button { display:flex; gap:9px; align-items:baseline; margin:0; text-align:left; background:transparent; color:#314b3a; font-size:14px; line-height:1.5; padding:8px; flex:none }
+#review-list button span:last-child { min-width:0; white-space:pre-wrap; overflow-wrap:anywhere }
+#review-list button[aria-current=true] { background:white; border-color:#a9beaf; color:#174b33 }
+#review-reading { padding:22px 26px; min-height:220px; overflow-wrap:anywhere }
+#review-reading h3 { font-size:20px; line-height:1.5; margin:6px 0 12px }
+#review-reading h4 { font-size:13px; color:#52705b; margin:18px 0 5px }
+#review-reading .prose { color:#24392e; font-size:14px; line-height:1.5 }
+.review-tags { display:flex; gap:6px; flex-wrap:wrap }
+.review-tags span { border-radius:4px; background:#eef3eb; color:#48624f; padding:1px 7px; font-size:12px }
+@media(max-width:620px) {
+  .draft-head { padding-left:14px }
+  .draft-tools,.draft-footer { padding:10px 14px }
+  #draft-form .draft-list,.review-layout { margin:0 12px 12px }
+  .draft-body .fields,.review-layout { grid-template-columns:1fr }
+  .review-layout { margin-top:12px }
+  #review-list { max-height:19vh; border-right:0; border-bottom:1px solid var(--edge) }
+  #review-reading { max-height:38vh; min-height:130px; padding:12px 16px }
+}

@@ -31,14 +31,14 @@ function dialog(html) {
   if (!$('#editor').open) $('#editor').showModal();
 }
 function fields(item={}) {
-  return `<fieldset class="fields"><label>题干<textarea name="question" required maxlength="10000">${esc(item.question)}</textarea></label>
-    <label>参考答案<textarea name="answer" maxlength="30000">${esc(item.answer)}</textarea></label>
-    <label>知识点（逗号分隔）<input name="tags" value="${esc((item.tags || []).join('，'))}"></label>
-    <label>来源位置<input name="locator" maxlength="500" value="${esc(item.locator)}" placeholder="章节或题号"></label></fieldset>`;
+  return `<fieldset class="fields"><label>题干<textarea name="question" rows="1" required maxlength="10000">${esc(item.question)}</textarea></label>
+    <label>参考答案<textarea name="answer" rows="2" maxlength="30000">${esc(item.answer)}</textarea></label>
+    <label>知识点（逗号分隔）<textarea name="tags" rows="1">${esc((item.tags || []).join('，'))}</textarea></label>
+    <label>来源位置<textarea name="locator" rows="1" maxlength="500" placeholder="章节或题号">${esc(item.locator)}</textarea></label></fieldset>`;
 }
 function readFields(node) {
   return {question:node.querySelector('[name=question]').value.trim(), answer:node.querySelector('[name=answer]').value.trim(),
-    tags:node.querySelector('[name=tags]').value.split(/[,，]/).map(x=>x.trim()).filter(Boolean),
+    tags:node.querySelector('[name=tags]').value.split(/[,，\n]/).map(x=>x.trim()).filter(Boolean),
     locator:node.querySelector('[name=locator]').value.trim()};
 }
 async function refresh() {
@@ -54,14 +54,76 @@ async function refresh() {
       <div class="actions">${button('编辑','edit',q.question_id)}${button('删除题目','remove-question',q.question_id)}</div></article>`;
   }).join('') || '<p>没有符合条件的已确认题目。</p>';
 }
+function questionSummary(title, number) {
+  return `<summary><span class="draft-number">${number}</span><span class="draft-title">${esc(title || '未填写题干')}</span></summary>`;
+}
 function questionPreview(items) {
-  return items.map((q, i) => `<article><h3>${i + 1}. ${esc(q.question)}</h3>
-    <p class="prose">${esc(q.answer || '无参考答案')}</p><small>${esc(q.tags.join(' · '))} ${esc(q.locator)}</small></article>`).join('');
+  return `<div class="draft-list">${items.map((q, i) => `<details class="draft-row">
+    ${questionSummary(q.question, i + 1)}<div class="draft-body"><strong>参考答案</strong>
+    <p class="prose">${esc(q.answer || '无参考答案')}</p><small>${esc(q.tags.join(' · '))} ${esc(q.locator)}</small>
+    </div></details>`).join('')}</div>`;
 }
-function draftForm(items, note = '请按原文填写，核对后再确认。') {
-  dialog(`<h2>整理题目草稿</h2><p>${esc(edit.filename)} · ${esc(note)}</p><form id="draft-form">
-    <div id="drafts" style="width:100%">${items.map(fields).join('')}</div>${button('再加一道','more')}<button>预览草稿</button></form>`);
+function editableDraft(q, number) {
+  return `<details class="draft-row" ${q.question ? '' : 'open'}>${questionSummary(q.question, number)}
+    <div class="draft-body">${fields(q)}<div class="draft-moves">${button('上移','up')}${button('下移','down')}</div></div></details>`;
 }
+function draftForm(items, note = '') {
+  dialog(`<div class="draft-workspace"><header class="draft-head"><h2>整理题目草稿</h2>
+    <p>${esc(edit.filename)}</p></header>${note ? `<p class="draft-note">${esc(note)}</p>` : ''}
+    <form id="draft-form"><div class="draft-tools"><strong id="draft-count">共 ${items.length} 道</strong>
+      <label>排序 <select id="draft-sort"><option value="">当前顺序</option><option value="locator">按原文位置</option><option value="question">按题干</option></select></label></div>
+    <div id="drafts" class="draft-list">${items.map((item,i)=>editableDraft(item,i+1)).join('')}</div>
+    <footer class="draft-footer">${button('再加一道','more')}<button>预览草稿</button></footer></form></div>`);
+}
+function previewDrafts() {
+  const items = edit.drafts;
+  dialog(`<div class="draft-workspace"><header class="draft-head"><h2>核对题目草稿</h2>
+    <p>${esc(edit.filename)} · 共 ${items.length} 道</p></header>
+    <div class="review-layout"><nav id="review-list" aria-label="选择预览题目">${items.map((q,i) =>
+      `<button type="button" data-action="review-one" data-id="${i}"><span class="draft-number">${i+1}</span><span>${esc(q.question)}</span></button>`).join('')}
+    </nav><article id="review-reading" aria-live="polite"></article></div>
+    <footer class="draft-footer">${button('返回编辑','back')}<button type="button" data-action="confirm" data-id="${esc(edit.id)}">确认入库</button></footer></div>`);
+  showDraft(0);
+}
+function showDraft(index) {
+  const q = edit.drafts[index];
+  for (const node of $('#review-list').children) node.setAttribute('aria-current', String(Number(node.dataset.id) === index));
+  const panel = $('#review-reading');
+  panel.innerHTML = `<small>第 ${index+1} / ${edit.drafts.length} 题</small><h3>${esc(q.question)}</h3>
+    ${q.tags.length ? `<div class="review-tags">${q.tags.map(t=>`<span>${esc(t)}</span>`).join('')}</div>` : ''}
+    <h4>参考答案</h4><p class="prose">${esc(q.answer || '原文未提供答案')}</p>
+    ${q.locator ? `<h4>原文位置</h4><p>${esc(q.locator)}</p>` : ''}`;
+  panel.scrollTop = 0;
+}
+function renumberDrafts() {
+  const rows = [...$('#drafts').children];
+  rows.forEach((row, i) => { row.querySelector('.draft-number').textContent = i + 1; });
+  $('#draft-count').textContent = '共 ' + rows.length + ' 道';
+}
+document.addEventListener('input', event => {
+  const row = event.target.closest('#drafts .draft-row');
+  if (row && event.target.name === 'question') {
+    row.querySelector('.draft-title').textContent = event.target.value.trim() || '未填写题干';
+  }
+  if (row) $('#draft-sort').value = '';
+});
+document.addEventListener('change', event => {
+  if (event.target.id !== 'draft-sort' || !event.target.value) return;
+  const list = $('#drafts');
+  const key = event.target.value;
+  const collator = new Intl.Collator('zh-CN', {numeric: true});
+  const value = row => row.querySelector(`[name="${key}"]`).value.trim();
+  const rows = [...list.children].sort((a, b) => {
+    const left = value(a), right = value(b);
+    return left && right ? collator.compare(left, right) : Number(!left) - Number(!right);
+  });
+  list.append(...rows);
+  renumberDrafts();
+});
+document.addEventListener('invalid', event => {
+  const row = event.target.closest('#drafts .draft-row');
+  if (row) row.open = true;
+}, true);
 $('#upload').onclick = () => $('#file').click();
 $('#file').onchange = async event => {
   const file = event.target.files[0]; if (!file) return;
@@ -98,7 +160,25 @@ document.addEventListener('click',async event=>{
         draftForm([{}], '自动拆题待接入，可手动整理后确认。');
       }
     }
-    if(action==='more')$('#drafts').insertAdjacentHTML('beforeend',fields());
+    if (action === 'more') {
+      const list = $('#drafts');
+      list.insertAdjacentHTML('beforeend', editableDraft({}, list.children.length + 1));
+      renumberDrafts();
+      $('#draft-sort').value = '';
+      list.lastElementChild.querySelector('textarea').focus();
+    }
+    if (action === 'up' || action === 'down') {
+      const row = b.closest('.draft-row');
+      const neighbor = action === 'up' ? row.previousElementSibling : row.nextElementSibling;
+      if (neighbor) {
+        if (action === 'up') neighbor.before(row);
+        else neighbor.after(row);
+        renumberDrafts();
+        $('#draft-sort').value = '';
+        row.querySelector('summary').focus();
+      }
+    }
+    if (action === 'review-one') showDraft(Number(id));
     if(action==='back')draftForm(edit.drafts);
     if(action==='confirm'){
       const result=await api('/documents/'+id+'/confirm','POST',{questions:edit.drafts});
@@ -130,8 +210,7 @@ document.addEventListener('submit',async event=>{
     if(form.id==='draft-form'){
       edit.drafts=[...form.querySelectorAll('fieldset')].map(readFields);
       if(edit.drafts.some(d=>!d.question))throw new Error('请填写每道题的题干。');
-      dialog('<h2>核对题目草稿</h2>'+questionPreview(edit.drafts)+
-        button('返回编辑','back')+button('确认入库','confirm',edit.id));
+      previewDrafts();
     }
     if(form.id==='search-form'){
       try{const result=await api('/search','POST',{topic:form.elements.topic.value,limit:Number(form.elements.limit.value)}); $('#search-result').textContent=JSON.stringify(result)}
