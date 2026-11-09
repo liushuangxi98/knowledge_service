@@ -6,3 +6,5 @@ SQLAlchemy==2.0.55
 PyMySQL[rsa]==1.2.3
 python-multipart==0.0.32
 chromadb==1.5.9
+httpx==0.28.1
+openai==3.46.0
