@@ -14,5 +14,6 @@ class QuestionDrafts(BaseModel):
 
 
 class SearchInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True)
     topic: str = Field(min_length=1, max_length=2000, description='希望检索的考点或问题，例如“如何评估向量检索的召回效果”。')
     limit: int = Field(default=5, ge=1, le=100, description='本次检索最多返回的题目数量，默认 5 道，范围为 1 到 100 道。')

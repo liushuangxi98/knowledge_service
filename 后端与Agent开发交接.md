@@ -1,10 +1,10 @@
 # 知识库后端与 Agent 开发交接
 
-适用工程：`knowledge_service`，按提交 `3e812d5` 核对。管理页面和 FastAPI 使用 8200，独立 Chroma 服务默认使用 8100。
+适用工程：`knowledge_service`。管理页面和 FastAPI 使用 8200，独立 Chroma 服务默认使用 8100。
 
-**先写 `parse_questions.py`。** 拆题与全量重建都有后端调用入口。实现约定的同步函数、重启服务，就能从「整理草稿」按钮验证。之后再写 `embeddings.py` 和 `rag.py`；全量重建按钮已接线，语义检索还需接入后端。
+管理页面通过 FastAPI 调用三个同步模块：Markdown 拆题、文本向量化、Chroma 全量重建与考点召回。后端维护正式题目、确认状态及索引状态。
 
-| 阶段 | 谁提供输入 | 你要写什么 | 结果交给谁 |
+| 阶段 | 谁提供输入 | 执行逻辑 | 结果交给谁 |
 | --- | --- | --- | --- |
 | 上传 Markdown | 浏览器上传文件 | 已实现，上传阶段没有模型调用 | 原件在磁盘，文档 ID 在 MySQL |
 | 整理草稿 | 后端传入文档 ID 和已解码的原文 | `parse_questions(document_id, source)` | 返回题目列表，前端预览、编辑 |
@@ -26,7 +26,7 @@ def parse_questions(document_id: str, source: str) -> list[dict]:
 点击「整理草稿」会发送 `POST /api/documents/{id}/prepare`。后端的 `Library.prepare()` 先查看该文档的 `questions_llm_confirmed`：
 
 - **True**：直接从 MySQL 取这份文档现存的正式题目，返回 `status="confirmed"`。哪怕五道题全部是 `pending`，拆题函数也不会被调用。用户后来删光了题目，会得到空的已确认列表。
-- **False**：后端读取原件，以 UTF-8 解码（兼容 BOM），执行 `parse_questions(document_id, source)`。它会逐条用 `QuestionInput` 校验返回值，再以 `status="draft"` 交给前端。解析器未接入时接口返回 501，页面允许手动整理。
+- **False**：后端读取原件，以 UTF-8 解码（兼容 BOM），执行 `parse_questions(document_id, source)`。它会逐条用 `QuestionInput` 校验返回值，再以 `status="draft"` 交给前端。Agent 直接使用 SDK 响应，调用失败时向上抛出原始异常。
 
 **函数内部只需要处理原文。** 从 `source` 找出题目边界，提取题干、原文答案和原文位置，补上知识点标签。使用 LLM 时，可以把这些要求写进提示词，用一个含 `questions: list[QuestionInput]` 的结构化结果接收输出，最后返回其中的题目列表。后端当前直接同步调用这个函数，因此这里使用普通 `def`。如模型调用失败，要让调用方看到错误；空列表只用于确实没有提取到题目的情况。
 
@@ -71,29 +71,22 @@ def parse_questions(document_id: str, source: str) -> list[dict]:
 
 ## 3. 全量重建：已接好的 Agent 接口
 
-只在用户点击按钮时调用 `POST /api/index/rebuild`，不传搜索词或题目 ID。后端从 MySQL 读取当时全部正式题目，调用 [rag.py](knowledge_agent/rag.py) 的同步函数 `rebuild_index(questions: list[dict]) -> None`。每项含 question_id、question、answer、tags、locator、document_id 和 index_status。函数正常返回表示本轮成功，失败请抛异常。未接入时接口返回 501。
+只在用户点击按钮时调用 `POST /api/index/rebuild`，不传搜索词或题目 ID。后端从 MySQL 读取当时全部正式题目，调用 [rag.py](knowledge_agent/rag.py) 的同步函数 `rebuild_index(questions: list[dict]) -> None`。每项含 question_id、question、answer、tags、locator、document_id 和 index_status。函数正常返回表示本轮成功，失败请抛异常。Chroma 不可用时提示检查服务。
 
 1. 用每条题干和标签组织文本，在 [embeddings.py](knowledge_agent/embeddings.py) 调百炼生成向量；即使 index_status 已是 indexed，也重新生成。
 2. 用正式 question_id 作 Chroma ID 分批 upsert。全部写成功后，对比本集合中的 ID 和本次题目 ID，删除只存在于 Chroma 的旧记录；不要先清空集合。传入空列表表示 MySQL 已无题目，此时清理本题库集合的旧向量即可。
 3. 后端在函数成功返回后回写 indexed；重建期间新增、删除或改动了题干和标签的题目不计入这次成功数。Agent 失败时后端不回写状态。下次再点按钮仍从全库开始。
 
-手动添加、确认入库、编辑、删除都只操作 MySQL；没有自动索引任务、单题重算或按 pending 补建的接口。
+手动添加、确认和编辑只写 MySQL。删除单题或文档时，后端把所有受影响的题目 ID 以 [{"question_id": ID}] 交给同步函数 rag.del_index；零道题时跳过调用。接口应当把不存在的向量视为已删除，以便安全重试。向量删除抛错时，MySQL 事务回滚，暂存的 Markdown 原件恢复。
 
-## 4. 检索：面试 Agent 如何拿到答案和出处
+## 4. 检索
 
-将来求职项目只需调用知识库的 `POST /api/search`，例如发送 `{"topic":"如何改善召回结果的顺序？","limit":3}`。建议在 `rag.py` 实现以下顺序：
-
-1. 用相同的 Embedding 模型把 `topic` 转成一个查询向量。
-2. 用 `collection.query(query_embeddings=[query_vector], n_results=limit)` 召回候选。单条查询的 ID 排名在 `result["ids"][0]`。
-3. 按召回 ID 回 MySQL 读取题干、最新参考答案、标签、文档 ID 和原文位置，排除已删除或尚待重建的记录，按 Chroma 的排名组装最多 `limit` 条结果。没有有效命中才返回空结果。
-4. 在 [backend/app.py](backend/app.py) 的 `search()` 接上这个函数；同时替换路由装饰器上的固定 `status_code=501` 和函数体内的 `HTTPException(501, ...)`。当前只定义了请求模型，成功响应的字段需要在接线时与调用方确定。建议使用 `{"items": [...]}`，每项保留真实的 `question_id`、题干、答案、`document_id` 和 `locator`。
-
-面试服务拿到这些题目后，再决定问哪一题、是否追问、怎样评价回答。知识库提供题目和出处。
+发送 `POST /api/search`，例如 `{"topic":"如何改善召回结果的顺序？","limit":3}`。后端调用 `rag.search_ids(topic, limit)` 取得按相似度排列的题目 ID，再回 MySQL 排除已删除或待索引的题目。过滤后可能少于 limit 道，返回 `{"items":[...]} `，包含正式 ID、最新题干、答案、标签、document_id 和 locator。模拟面试业务通过该 HTTP 接口取题。
 
 ## 5. 按什么顺序验收
 
 1. **先测拆题。** 准备一份有 5 道题的 Markdown，至少一道没有答案。上传后点「整理草稿」应预填 5 道；核对空答案和每个 locator。确认其中一处人工修改，刷新或重启后再次打开，看到原来的 5 个 ID、人工修改仍在，拆题调用次数仍为 1。
 2. **再测向量。** 用模型替身检查 5 个正式 ID 与 5 个输入文本、5 个向量一一对应，再用真实服务验证一份小样本。模拟百炼或 Chroma 暂时失败，题目应仍可在页面查看；恢复后手动全量重建，用相同 ID 写入，向量记录数仍为 5。
-3. **最后测检索和变更。** 用原文没有出现的同义问法查询，能找回预期题目并根据 locator 打开原文。只改答案后应读到新答案；改题干后应重建；删题或删文档后检索应排除失效记录，下次全量重建清理其向量。
+3. **最后测检索和变更。** 用原文没有出现的同义问法查询，能找回预期题目并根据 locator 打开原文。只改答案后应读到新答案；改题干后应重建；删题或删文档后检索应排除失效记录，删除请求同时清理对应向量。
 
 现有 [tests/test_library.py](tests/test_library.py) 已覆盖“已确认跳过解析器”、失败回滚、旧库标记回填及重复确认。数据库回归使用隔离实例，真实模型、真实向量和检索效果要分别验证。启动命令和测试环境变量见[项目使用说明](项目使用说明.md)。

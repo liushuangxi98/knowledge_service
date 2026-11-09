@@ -7,6 +7,7 @@ from fastapi.staticfiles import StaticFiles
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import sessionmaker
 
+from openai import OpenAIError
 from .config import Settings, ROOT
 from .database import make_engine
 from .middleware import BodyLimitMiddleware
@@ -27,6 +28,11 @@ def create_app(settings=None):
     app = FastAPI(title='面试知识库', lifespan=lifespan)
     app.add_middleware(BodyLimitMiddleware)
     app.mount('/static', StaticFiles(directory=ROOT / 'frontend'), name='frontend')
+
+    @app.exception_handler(OpenAIError)
+    async def model_error(request, exc):
+        status = 413 if getattr(exc, 'status_code', None) == 413 else 502
+        return JSONResponse({'detail': '模型请求超过大小限制' if status == 413 else '模型请求失败'}, status_code=status)
 
     @app.exception_handler(SQLAlchemyError)
     async def database_error(request, exc):
@@ -95,8 +101,8 @@ def create_app(settings=None):
     def rebuild_index():
         return library.rebuild_index()
 
-    @app.post('/api/search', status_code=501)
+    @app.post('/api/search')
     def search(body: SearchInput):
-        raise HTTPException(501, '知识检索待接入，请先实现 Embedding、索引与召回。')
+        return library.search(body.topic, body.limit)
 
     return app

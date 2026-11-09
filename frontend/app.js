@@ -181,8 +181,7 @@ document.addEventListener('click',async event=>{
         }
       } catch (error) {
         if (edit !== doc || !$('#editor').open) return;
-        if (error.status !== 501) throw error;
-        draftForm([{}], '自动拆题待接入，可手动整理后确认。');
+        throw error;
       }
     }
     if (action === 'more') {
@@ -238,8 +237,19 @@ document.addEventListener('submit',async event=>{
       previewDrafts();
     }
     if(form.id==='search-form'){
-      try{const result=await api('/search','POST',{topic:form.elements.topic.value,limit:Number(form.elements.limit.value)}); $('#search-result').textContent=JSON.stringify(result)}
-      catch(e){$('#search-result').textContent=e.message}
+      const panel = $('#search-result');
+      panel.textContent = '正在检索…';
+      try {
+        const {items} = await api('/search', 'POST', {topic:form.elements.topic.value, limit:Number(form.elements.limit.value)});
+        panel.innerHTML = items.map(q => {
+          const doc = documents.find(d => d.id === q.document_id);
+          const source = q.document_id ? `<a href="/api/documents/${encodeURIComponent(q.document_id)}/content" target="_blank" rel="noopener">${esc(doc?.filename || '查看原文')}</a>` : '手动录入';
+          return `<article class="row"><div><h3>${esc(q.question)}</h3>${answerHTML(q.answer, '暂无参考答案')}
+            <small>${source} ${esc(q.locator)}</small></div></article>`;
+        }).join('') || '没有可返回的已索引题目。';
+      } catch (error) {
+        panel.textContent = error.message;
+      }
     }
   }catch(e){status(e.message,true)}finally{delete form.dataset.busy;if(submit)submit.disabled=false}
 });

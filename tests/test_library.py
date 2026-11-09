@@ -14,10 +14,11 @@ from backend.database import Question, initialize, make_engine
 
 @pytest.fixture
 def library(tmp_path, monkeypatch):
-    # 接口测试使用替身，不发真实 LLM、Embedding 或 Chroma 请求。
-    from knowledge_agent import parse_questions, rag
-    monkeypatch.delattr(parse_questions, 'parse_questions', raising=False)
-    monkeypatch.delattr(rag, 'rebuild_index', raising=False)
+    # 默认关闭测试进程的模型配置，避免误用开发者本机密钥。
+    for name in ('LLM_API_KEY', 'EMBEDDING_API_KEY'):
+        monkeypatch.setenv(name, '')
+    from knowledge_agent import rag
+    monkeypatch.setattr(rag, 'del_index', lambda questions: None)
     if not os.environ.get('KNOWLEDGE_TEST_MYSQL_PORT'):
         pytest.skip('请指定隔离实例的 KNOWLEDGE_TEST_MYSQL_PORT 和 KNOWLEDGE_TEST_MYSQL_PASSWORD')
     database = 'knowledge_test_' + uuid4().hex
@@ -46,7 +47,7 @@ def test_document_confirm_and_index_state(library):
     original = '# 第一章\n什么是检索？'.encode()
     doc = upload(client, '题库.md', original).json()
     key = doc['id']
-    assert doc['parse_status'] == 'not_connected'
+    assert doc['parse_status'] == 'ready'
     assert upload(client, '另一文件名.md', original).json()['id'] == key
     assert len(client.get('/api/documents').json()) == 1
     assert client.get(f'/api/documents/{key}/content').content == original
@@ -82,15 +83,17 @@ def test_document_confirm_and_index_state(library):
     assert not list(settings.originals_dir.iterdir())
 
 
-def test_upload_limits_and_search(library):
+def test_upload_limits_and_search(library, monkeypatch):
+    monkeypatch.setattr("knowledge_agent.rag.search_ids", lambda topic, limit: [])
     client, _ = library
     for name, data in [('错.txt', b'x'), ('空.md', b' \n'), ('坏.md', b'\xff')]:
         assert upload(client, name, data).status_code == 422
     assert upload(client, '大.md', b'x'*(16*1024**2+1)).status_code == 413
     assert client.post('/api/documents', content=b'', headers={'content-length': str(48*1024**2+1)}).status_code == 413
     assert client.get('/api/documents').json() == []
-    assert client.post('/api/search', json={'topic': '工具调用', 'limit': 3}).status_code == 501
+    assert client.post('/api/search', json={'topic': '工具调用', 'limit': 3}).json() == {'items': []}
     assert client.post('/api/search', json={'topic': '工具调用', 'limit': 0}).status_code == 422
+    assert client.post('/api/search', json={'topic': '   '}).status_code == 422
 
 
 def test_manual_full_rebuild(library, monkeypatch):
@@ -99,7 +102,6 @@ def test_manual_full_rebuild(library, monkeypatch):
 
     client, _ = library
     url = '/api/index/rebuild'
-    assert client.post(url).status_code == 501
     rebuild = Mock()
     monkeypatch.setattr(rag, 'rebuild_index', rebuild, raising=False)
     assert client.post(url).json() == {'total': 0, 'indexed': 0}
@@ -174,7 +176,6 @@ def test_upgrade_backfills_old_confirmations(library):
     initialize(settings)
     flags = {doc['id']: doc['questions_llm_confirmed'] for doc in client.get('/api/documents').json()}
     assert flags == {key: True, new: False}
-    assert client.post(f'/api/documents/{new}/prepare').status_code == 501
 
 
 def test_failed_confirm_rolls_back_flag_and_questions(library, monkeypatch):
@@ -231,3 +232,187 @@ def test_upgrade_numbers_old_questions_once(library):
     client.delete('/api/questions/' + rows[0]['question_id']).raise_for_status()
     initialize(settings)
     assert [q['sort_order'] for q in client.get('/api/questions').json()] == [2, 3]
+
+def mock_model_http(monkeypatch, handler):
+    """保留完整 SDK 调用链，只替换最后发出 HTTP 请求的传输层。"""
+    import httpx
+    from openai import OpenAI
+    from knowledge_agent import model_api
+    def client(**options):
+        return OpenAI(**options, http_client=httpx.Client(transport=httpx.MockTransport(handler)))
+    monkeypatch.setattr(model_api, 'OpenAI', client)
+
+
+def test_agent_pipeline_with_chroma(library, monkeypatch):
+    """真实走 HTTP 路由、模型请求格式、MySQL 与 Chroma；只替换外部模型的 HTTP 响应。"""
+    import json
+    from contextlib import contextmanager
+    import chromadb
+    import httpx
+    from knowledge_agent import rag
+
+    client, _ = library
+    for prefix in ('LLM', 'EMBEDDING'):
+        monkeypatch.setenv(prefix + '_BASE_URL', 'http://model.invalid/v1')
+        monkeypatch.setenv(prefix + '_MODEL', 'test-' + uuid4().hex)
+        monkeypatch.setenv(prefix + '_API_KEY', 'test')
+    # CI 可指定专属 HTTP 服务；本地无独立实例时仍使用真实 Chroma 引擎验证召回。
+    test_url = os.getenv('KNOWLEDGE_TEST_CHROMA_URL')
+    if test_url:
+        monkeypatch.setenv('CHROMA_URL', test_url)
+    else:
+        store = chromadb.EphemeralClient()
+        collection = store.create_collection('test-' + uuid4().hex, embedding_function=None)
+        @contextmanager
+        def local_collection(create=False):
+            yield collection
+        monkeypatch.setattr(rag, 'question_collection', local_collection)
+    topics = ['排序', '切片', '评估', '超时', '坐标']
+    drafts = [{'question': '怎样做' + t, 'tags': [t], 'answer': '答案' if i else '', 'locator': f'第{i+1}题'}
+              for i, t in enumerate(topics)]
+    calls = []
+    def model_response(request):
+        url = str(request.url)
+        body = json.loads(request.content)
+        assert request.headers["authorization"] == "Bearer test"
+        calls.append(url)
+        if url.endswith('/chat/completions'):
+            assert '# 题库' in body['messages'][-1]['content']
+            payload = {'choices': [{'finish_reason': 'tool_calls', 'message': {'role': 'assistant', 'tool_calls': [{'type': 'function', 'id': 'test-call',
+                'function': {'name': 'extract_questions', 'arguments': encoded_drafts}}]}}]}
+        else:
+            assert body['encoding_format'] == 'float' and 1 <= len(body['input']) <= 10
+            data = []
+            for i, value in enumerate(body['input']):
+                assert isinstance(value, str)
+                k = 0 if '换个顺序' in value else next(i for i,t in enumerate(topics) if t in value)
+                data.append({'index': i, 'embedding': [float(j == k) for j in range(len(topics))]})
+            payload = {'data': data[::-1]}
+        return httpx.Response(200, json=payload)
+    encoded_drafts = json.dumps({'questions': drafts}, ensure_ascii=False)
+    mock_model_http(monkeypatch, model_response)
+    key = upload(client, '原文.md', '# 题库'.encode()).json()['id']
+    url = f'/api/documents/{key}'
+    prepared = client.post(url + '/prepare').json()
+    assert prepared['questions'] == drafts
+    prepared['questions'][0]['answer'] = '用户确认的答案'
+    client.post(url + '/confirm', json={'questions': prepared['questions']}).raise_for_status()
+    assert client.post(url + '/prepare').json()['status'] == 'confirmed'
+    assert len(calls) == 1
+    assert client.post('/api/index/rebuild').json() == {'total': 5, 'indexed': 5}
+    query = {'topic': '换个顺序', 'limit': 1}
+    def best():
+        response = client.post('/api/search', json=query)
+        assert response.status_code == 200, response.text
+        return response.json()['items'][0]
+    q = best()
+    assert (q['question'], q['answer'], q['document_id'], q['locator']) == ('怎样做排序', '用户确认的答案', key, '第1题')
+    update = {**drafts[0], 'answer': '最新答案'}
+    item_url = '/api/questions/' + q['question_id']
+    client.put(item_url, json=update).raise_for_status()
+    assert best()['answer'] == '最新答案'
+    client.put(item_url, json={**update, 'question': '新的排序问题'}).raise_for_status()
+    assert client.post('/api/search', json=query).json()['items'] == []
+    assert client.post('/api/index/rebuild').json()['indexed'] == 5
+    assert best()['question'] == '新的排序问题'
+    client.delete(item_url).raise_for_status()
+    assert client.post('/api/search', json=query).json()['items'] == []
+    assert client.post('/api/index/rebuild').json()['indexed'] == 4
+    with rag.question_collection() as collection:
+        assert collection.count() == 4
+    client.delete(url).raise_for_status()
+    assert client.post('/api/index/rebuild').json()['total'] == 0
+    with rag.question_collection() as collection:
+        assert collection.count() == 0
+
+
+def test_embedding_propagates_sdk_413_without_retry(monkeypatch):
+    import httpx
+    from openai import APIStatusError
+    from unittest.mock import Mock
+    from knowledge_agent.embeddings import embed_texts
+    monkeypatch.setenv('EMBEDDING_API_KEY', 'test')
+    monkeypatch.setenv('EMBEDDING_MODEL', 'test')
+    monkeypatch.setenv('EMBEDDING_BASE_URL', 'http://model.invalid/v1')
+    send = Mock(return_value=httpx.Response(413))
+    mock_model_http(monkeypatch, send)
+    with pytest.raises(APIStatusError) as error:
+        embed_texts(['一题'])
+    assert error.value.status_code == 413
+    send.assert_called_once()
+
+
+def test_embedding_batches_keep_text_order(monkeypatch):
+    import json
+    import httpx
+    from knowledge_agent import embeddings
+    monkeypatch.setenv('EMBEDDING_BASE_URL', 'http://model.invalid/v1')
+    monkeypatch.setenv('EMBEDDING_MODEL', 'test')
+    monkeypatch.setenv('EMBEDDING_API_KEY', 'test')
+    batches = []
+    def respond(request):
+        texts = json.loads(request.content)['input']
+        batches.append(len(texts))
+        return httpx.Response(200, json={'data': [{'index': i, 'embedding': [float(texts[i])]} for i in reversed(range(len(texts)))]})
+    mock_model_http(monkeypatch, respond)
+    got = embeddings.embed_texts([str(i) for i in range(23)])
+    assert got == [[float(i)] for i in range(23)]
+    assert batches == [10, 10, 3]
+
+
+def test_search_with_two_arguments_filters_stale_hits_in_rank_order(library, monkeypatch):
+    from knowledge_agent import rag
+
+    client, settings = library
+    ids = [client.post('/api/questions', json={'question': q}).json()['question_id']
+           for q in ['第一题', '第二题', '待建题']]
+    engine = make_engine(settings)
+    with Session(engine) as session, session.begin():
+        for key in ids[:2]:
+            session.get(Question, key).index_status = 'indexed'
+    engine.dispose()
+
+    def search_ids(topic, limit):
+        assert (topic, limit) == ('测试考点', 4)
+        return [ids[1], 'deleted-id', ids[2], ids[0]]
+
+    monkeypatch.setattr(rag, 'search_ids', search_ids)
+    response = client.post('/api/search', json={'topic': '测试考点', 'limit': 4})
+    assert response.status_code == 200
+    assert [item['question_id'] for item in response.json()['items']] == [ids[1], ids[0]]
+
+
+def test_vector_deletion_follows_question_and_document(library, monkeypatch):
+    from unittest.mock import Mock
+    from knowledge_agent import rag
+
+    client, settings = library
+    source = b'# original'
+    doc = upload(client, '测试.md', source).json()['id']
+    ids = client.post(f'/api/documents/{doc}/confirm', json={'questions': [
+        {'question': q} for q in ('第一题', '第二题', '第三题')]}).json()['question_ids']
+    other = client.post('/api/questions', json={'question': '独立题目'}).json()['question_id']
+    remove = Mock(side_effect=RuntimeError('unavailable'))
+    monkeypatch.setattr(rag, 'del_index', remove)
+
+    assert client.delete('/api/questions/'+ids[0]).status_code == 502
+    assert len(client.get('/api/questions').json()) == 4
+    remove.side_effect = None
+    assert client.delete('/api/questions/'+ids[0]).status_code == 204
+    remove.assert_called_with([{'question_id': ids[0]}])
+    assert client.get(f'/api/documents/{doc}/content').content == source
+
+    remove.side_effect = RuntimeError('unavailable')
+    assert client.delete('/api/documents/'+doc).status_code == 502
+    assert client.get(f'/api/documents/{doc}/content').content == source
+    assert len(client.get('/api/questions').json()) == 3
+    remove.side_effect = None
+    assert client.delete('/api/documents/'+doc).status_code == 204
+    assert {q['question_id'] for q in remove.call_args.args[0]} == set(ids[1:])
+    assert [q['question_id'] for q in client.get('/api/questions').json()] == [other]
+    assert not list(settings.originals_dir.iterdir())
+
+    empty = upload(client, '空题库.md', b'# no questions').json()['id']
+    remove.reset_mock()
+    assert client.delete('/api/documents/'+empty).status_code == 204
+    remove.assert_not_called()

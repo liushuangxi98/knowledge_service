@@ -1,6 +1,5 @@
 """文档原件、已确认题目和索引状态的存储。拆题和检索由 knowledge_agent 接入。"""
 from hashlib import sha256
-from inspect import iscoroutinefunction
 from pathlib import Path
 from threading import Lock
 from uuid import uuid4
@@ -17,7 +16,7 @@ from .schemas import QuestionInput
 def show_document(doc):
     return {'id': doc.id, 'filename': doc.filename, 'created_at': doc.created_at,
             'questions_llm_confirmed': doc.questions_llm_confirmed,
-            'parse_status': 'ready' if callable(getattr(parse_questions, 'parse_questions', None)) else 'not_connected'}
+            'parse_status': 'ready'}
 
 
 def show_question(item):
@@ -73,23 +72,43 @@ class Library:
                 raise HTTPException(404, '原件文件不存在')
             return path.read_bytes()
 
-    def remove_document(self, key):
-        moved = False
+    @staticmethod
+    def delete_vectors(question_ids):
+        """把正式题目 ID 交给 Agent；尚未拆出题目的文档无需访问向量库。"""
+        if not question_ids:
+            return
         try:
-            with self.sessions.begin() as session:
-                doc = get_record(session, Document, key, lock=True)
-                path = self.originals / (doc.id + '.md')
-                backup = path.with_suffix('.deleting')
-                if path.exists():
-                    path.rename(backup)
-                    moved = True
-                session.delete(doc)  # 外键同步删除此文档的题目。
-        except Exception:
-            if moved:
-                backup.rename(path)
+            rag.del_index([{'question_id': key} for key in question_ids])
+        except HTTPException:
             raise
-        if moved:
-            backup.unlink()
+        except Exception as exc:
+            status = getattr(exc, 'status_code', None) or getattr(getattr(exc, 'response', None), 'status_code', None)
+            if status == 413:
+                raise HTTPException(413, '向量删除请求超过大小限制，本次操作已停止') from None
+            raise HTTPException(502, '向量删除失败，本次数据库删除已撤销') from None
+
+    def remove_document(self, key):
+        # 与重建共用锁，避免重建从旧快照把刚删除的向量写回。
+        with self.index_lock:
+            moved = False
+            try:
+                with self.sessions.begin() as session:
+                    doc = get_record(session, Document, key, lock=True)
+                    ids = session.scalars(select(Question.question_id).where(Question.document_id == key)).all()
+                    path = self.originals / (doc.id + '.md')
+                    backup = path.with_suffix('.deleting')
+                    if path.exists():
+                        path.rename(backup)
+                        moved = True
+                    session.delete(doc)  # 数据库外键同时删除所属题目。
+                    session.flush()
+                    self.delete_vectors(ids)
+            except Exception:
+                if moved:
+                    backup.rename(path)
+                raise
+            if moved:
+                backup.unlink()
 
     def questions(self, query, document_id):
         # 全库列表按来源文档归组；手动题单独一组，每组均按已保存的题号显示。
@@ -110,11 +129,8 @@ class Library:
                 rows = session.scalars(select(Question).where(Question.document_id == key).order_by(Question.sort_order))
                 return {'status': 'confirmed', 'questions': [show_question(row) for row in rows]}
 
-        parser = getattr(parse_questions, 'parse_questions', None)
-        if parser is None:
-            raise HTTPException(501, '自动拆题待接入')
         source = self.original(key).decode('utf-8-sig')
-        drafts = parser(key, source)
+        drafts = parse_questions.parse_questions(key, source)
         return {'status': 'draft', 'questions': [QuestionInput.model_validate(item).model_dump() for item in drafts]}
 
     def confirm(self, key, drafts):
@@ -157,16 +173,13 @@ class Library:
 
     def rebuild_index(self):
         """按钮触发一次全库重建。Agent 负责向量，后端负责读取题目和回写状态。"""
-        rebuild = getattr(rag, 'rebuild_index', None)
-        if not callable(rebuild) or iscoroutinefunction(rebuild):
-            raise HTTPException(501, '全量重建待接入，请实现同步函数 knowledge_agent.rag.rebuild_index(questions)')
         if not self.index_lock.acquire(blocking=False):
             raise HTTPException(409, '全量重建正在进行中')
         try:
             # 传全部正式题目。空库也传 []，供 Agent 清理已删除题目的旧向量。
             questions = self.questions('', None)
             try:
-                rebuild(questions)
+                rag.rebuild_index(questions)
             except HTTPException:
                 raise
             except Exception as exc:
@@ -187,6 +200,18 @@ class Library:
         finally:
             self.index_lock.release()
 
+    def search(self, topic, limit):
+        # 按考点召回，再按原排名返回仍有效的题目和最新答案。
+        ids = rag.search_ids(topic, limit)
+        if not ids:
+            return {'items': []}
+        with self.sessions() as session:
+            rows = session.scalars(select(Question).where(Question.question_id.in_(ids), Question.index_status == 'indexed'))
+            by_id = {q.question_id: show_question(q) for q in rows}
+        return {'items': [by_id[key] for key in ids if key in by_id]}
+
     def remove_question(self, key):
-        with self.sessions.begin() as session:
+        with self.index_lock, self.sessions.begin() as session:
             session.delete(get_record(session, Question, key, lock=True))
+            session.flush()
+            self.delete_vectors([key])
