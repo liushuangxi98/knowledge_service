@@ -1,5 +1,4 @@
 """集成测试须在明确指定的隔离 MySQL 实例运行，每个用例创建自己的临时数据库。"""
-import ast
 import os
 from uuid import uuid4
 
@@ -9,12 +8,16 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from backend.app import create_app
-from backend.config import ROOT, Settings
+from backend.config import Settings
 from backend.database import Question, initialize, make_engine
 
 
 @pytest.fixture
-def library(tmp_path):
+def library(tmp_path, monkeypatch):
+    # 接口测试使用替身，不发真实 LLM、Embedding 或 Chroma 请求。
+    from knowledge_agent import parse_questions, rag
+    monkeypatch.delattr(parse_questions, 'parse_questions', raising=False)
+    monkeypatch.delattr(rag, 'rebuild_index', raising=False)
     if not os.environ.get('KNOWLEDGE_TEST_MYSQL_PORT'):
         pytest.skip('请指定隔离实例的 KNOWLEDGE_TEST_MYSQL_PORT 和 KNOWLEDGE_TEST_MYSQL_PASSWORD')
     database = 'knowledge_test_' + uuid4().hex
@@ -90,10 +93,43 @@ def test_upload_limits_and_search(library):
     assert client.post('/api/search', json={'topic': '工具调用', 'limit': 0}).status_code == 422
 
 
-def test_agent_modules_contain_only_their_docstrings():
-    for path in (ROOT / 'knowledge_agent').glob('*.py'):
-        module = ast.parse(path.read_text(encoding='utf-8'))
-        assert len(module.body) == 1 and ast.get_docstring(module)
+def test_manual_full_rebuild(library, monkeypatch):
+    from unittest.mock import Mock
+    from knowledge_agent import rag
+
+    client, _ = library
+    url = '/api/index/rebuild'
+    assert client.post(url).status_code == 501
+    rebuild = Mock()
+    monkeypatch.setattr(rag, 'rebuild_index', rebuild, raising=False)
+    assert client.post(url).json() == {'total': 0, 'indexed': 0}
+    rebuild.assert_called_once_with([])
+    rebuild.reset_mock()
+
+    doc = upload(client, '检索.md', b'# search').json()
+    client.post(f"/api/documents/{doc['id']}/confirm", json={'questions': [{'question': '召回'}]}).raise_for_status()
+    manual = client.post('/api/questions', json={'question': '重排'}).json()
+    rebuild.assert_not_called()
+    assert client.post(url).json() == {'total': 2, 'indexed': 2}
+    manual_url = '/api/questions/' + manual['question_id']
+    client.put(manual_url, json={'question': '新的重排题'}).raise_for_status()
+    assert rebuild.call_count == 1
+    def edit_during_rebuild(items):
+        assert {q['question'] for q in items} == {'召回', '新的重排题'}
+        assert {q['index_status'] for q in items} == {'indexed', 'pending'}
+        assert client.post(url).status_code == 409
+        client.put(manual_url, json={'question': '再次编辑'}).raise_for_status()
+    rebuild.side_effect = edit_during_rebuild
+    assert client.post(url).json() == {'total': 2, 'indexed': 1}
+    rebuild.side_effect = RuntimeError('test')
+    assert client.post(url).status_code == 502
+    state = {q['question']: q['index_status'] for q in client.get('/api/questions').json()}
+    assert state == {'召回': 'indexed', '再次编辑': 'pending'}
+    rebuild.side_effect = None
+    client.delete(manual_url).raise_for_status()
+    assert client.post(url).json() == {'total': 1, 'indexed': 1}
+    assert [q['question'] for q in rebuild.call_args.args[0]] == ['召回']
+
 
 def test_prepare_reuses_confirmed_questions_after_restart(library, monkeypatch):
     from unittest.mock import Mock

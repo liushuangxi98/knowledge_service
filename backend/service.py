@@ -1,13 +1,15 @@
 """文档原件、已确认题目和索引状态的存储。拆题和检索由 knowledge_agent 接入。"""
 from hashlib import sha256
+from inspect import iscoroutinefunction
 from pathlib import Path
+from threading import Lock
 from uuid import uuid4
 
 from fastapi import HTTPException
 from sqlalchemy import select
 from sqlalchemy.dialects.mysql import insert
 
-from knowledge_agent import parse_questions
+from knowledge_agent import parse_questions, rag
 from .database import Document, Question
 from .schemas import QuestionInput
 
@@ -34,6 +36,7 @@ class Library:
     def __init__(self, sessions, originals):
         self.sessions = sessions
         self.originals = Path(originals)
+        self.index_lock = Lock()
 
     def documents(self):
         with self.sessions() as session:
@@ -148,6 +151,38 @@ class Library:
                     setattr(item, name, value)
             session.flush()
             return show_question(item)
+
+    def rebuild_index(self):
+        """按钮触发一次全库重建。Agent 负责向量，后端负责读取题目和回写状态。"""
+        rebuild = getattr(rag, 'rebuild_index', None)
+        if not callable(rebuild) or iscoroutinefunction(rebuild):
+            raise HTTPException(501, '全量重建待接入，请实现同步函数 knowledge_agent.rag.rebuild_index(questions)')
+        if not self.index_lock.acquire(blocking=False):
+            raise HTTPException(409, '全量重建正在进行中')
+        try:
+            # 传全部正式题目。空库也传 []，供 Agent 清理已删除题目的旧向量。
+            questions = self.questions('', None)
+            try:
+                rebuild(questions)
+            except HTTPException:
+                raise
+            except Exception as exc:
+                status = getattr(exc, 'status_code', None) or getattr(getattr(exc, 'response', None), 'status_code', None)
+                if status == 413:
+                    raise HTTPException(413, '向量请求超过大小限制，本次重建已停止') from None
+                raise HTTPException(502, '全量重建失败，请检查 Embedding 和 Chroma 服务') from None
+
+            # 网络调用结束后才开写事务。重建期间有编辑的题目留待下一次手动重建。
+            snapshot = {q['question_id']: (q['question'], q['tags']) for q in questions}
+            indexed = 0
+            with self.sessions.begin() as session:
+                for row in session.scalars(select(Question).with_for_update()):
+                    if snapshot.get(row.question_id) == (row.question, row.tags):
+                        row.index_status = 'indexed'
+                        indexed += 1
+            return {'total': len(questions), 'indexed': indexed}
+        finally:
+            self.index_lock.release()
 
     def remove_question(self, key):
         with self.sessions.begin() as session:

@@ -91,6 +91,10 @@ def create_app(settings=None):
         library.remove_question(key)
         return Response(status_code=204)
 
+    @app.post('/api/index/rebuild')
+    def rebuild_index():
+        return library.rebuild_index()
+
     @app.post('/api/search', status_code=501)
     def search(body: SearchInput):
         raise HTTPException(501, '知识检索待接入，请先实现 Embedding、索引与召回。')

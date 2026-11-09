@@ -50,7 +50,7 @@
 #review-reading { padding:22px 26px; min-height:220px; overflow-wrap:anywhere }
 #review-reading h3 { font-size:20px; line-height:1.5; margin:6px 0 12px }
 #review-reading h4 { font-size:13px; color:#52705b; margin:18px 0 5px }
-#review-reading .prose { color:#24392e; font-size:14px; line-height:1.5 }
+#review-reading .markdown-answer { color:#24392e; font-size:14px; line-height:1.5 }
 .review-tags { display:flex; gap:6px; flex-wrap:wrap }
 .review-tags span { border-radius:4px; background:#eef3eb; color:#48624f; padding:1px 7px; font-size:12px }
 @media(max-width:620px) {
@@ -62,3 +62,16 @@
   #review-list { max-height:19vh; border-right:0; border-bottom:1px solid var(--edge) }
   #review-reading { max-height:38vh; min-height:130px; padding:12px 16px }
 }
+
+/* 表格和代码块只在答案内部滚动，窄屏也保留列的对应关系。 */
+.markdown-answer { min-width:0; max-width:100%; overflow-wrap:anywhere }
+.markdown-answer > :first-child { margin-top:0 }
+.markdown-answer > :last-child { margin-bottom:0 }
+.markdown-answer p { color:inherit }
+.markdown-answer img { max-width:100%; height:auto }
+.markdown-answer pre { overflow-x:auto; white-space:pre; padding:10px; background:#f3f5f2 }
+.markdown-answer code { font-family:Consolas,monospace }
+.answer-table { max-width:100%; overflow-x:auto; margin:8px 0 }
+.answer-table table { border-collapse:collapse; width:100%; font-size:14px }
+.answer-table th,.answer-table td { min-width:7em; padding:5px 9px; border:1px solid #cdd9d0; vertical-align:top }
+.answer-table th { background:#eef3ed }

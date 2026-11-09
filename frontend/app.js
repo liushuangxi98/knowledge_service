@@ -2,6 +2,15 @@ const $ = selector => document.querySelector(selector);
 const esc = value => String(value ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;'}[c]));
 let documents = [], questions = [], edit = null;
 
+// 只在展示答案时解析 Markdown。原始 HTML 会按文字转义，编辑和提交继续使用原文。
+const markdown = window.markdownit({html: false, breaks: true});
+markdown.renderer.rules.table_open = () => '<div class="answer-table"><table>';
+markdown.renderer.rules.table_close = () => '</table></div>';
+
+function answerHTML(answer, emptyText) {
+  return `<div class="markdown-answer">${answer ? markdown.render(answer) : esc(emptyText)}</div>`;
+}
+
 async function api(path, method = 'GET', body) {
   const options = {method};
   if (body instanceof FormData) options.body = body;
@@ -49,7 +58,7 @@ async function refresh() {
   $('#question-list').innerHTML = questions.map(q => {
     const doc = documents.find(d=>d.id===q.document_id);
     return `<article class="row"><div><h3>${esc(q.question)}</h3><small>${esc(q.tags.join(' · '))} ${q.index_status==='indexed'?'已索引':'待建索引'}</small>
-      <details><summary>答案与来源</summary><p class="prose">${esc(q.answer || '暂无参考答案')}</p>
+      <details><summary>答案与来源</summary>${answerHTML(q.answer, '暂无参考答案')}
       ${doc?`<a target="_blank" rel="noopener" href="/api/documents/${encodeURIComponent(doc.id)}/content">${esc(doc.filename)}</a>`:'手动录入'} ${esc(q.locator)}</details></div>
       <div class="actions">${button('编辑','edit',q.question_id)}${button('删除题目','remove-question',q.question_id)}</div></article>`;
   }).join('') || '<p>没有符合条件的已确认题目。</p>';
@@ -60,7 +69,7 @@ function questionSummary(title, number) {
 function questionPreview(items) {
   return `<div class="draft-list">${items.map((q, i) => `<details class="draft-row">
     ${questionSummary(q.question, i + 1)}<div class="draft-body"><strong>参考答案</strong>
-    <p class="prose">${esc(q.answer || '无参考答案')}</p><small>${esc(q.tags.join(' · '))} ${esc(q.locator)}</small>
+    ${answerHTML(q.answer, '无参考答案')}<small>${esc(q.tags.join(' · '))} ${esc(q.locator)}</small>
     </div></details>`).join('')}</div>`;
 }
 function editableDraft(q, number) {
@@ -91,7 +100,7 @@ function showDraft(index) {
   const panel = $('#review-reading');
   panel.innerHTML = `<small>第 ${index+1} / ${edit.drafts.length} 题</small><h3>${esc(q.question)}</h3>
     ${q.tags.length ? `<div class="review-tags">${q.tags.map(t=>`<span>${esc(t)}</span>`).join('')}</div>` : ''}
-    <h4>参考答案</h4><p class="prose">${esc(q.answer || '原文未提供答案')}</p>
+    <h4>参考答案</h4>${answerHTML(q.answer, '原文未提供答案')}
     ${q.locator ? `<h4>原文位置</h4><p>${esc(q.locator)}</p>` : ''}`;
   panel.scrollTop = 0;
 }
@@ -134,6 +143,22 @@ $('#file').onchange = async event => {
     const doc=await api('/documents','POST',body); await refresh();
     status(doc.reused ? '已复用相同原件。' : '原件已保存。');
   } catch(e){status(e.message,true)} finally{$('#upload').disabled=false}
+};
+$('#rebuild').onclick = async event => {
+  const button = event.currentTarget;
+  const message = $('#rebuild-status');
+  button.disabled = true;
+  message.hidden = false;
+  message.textContent = '正在重建全部题目的向量索引…';
+  try {
+    const result = await api('/index/rebuild', 'POST');
+    message.textContent = `本次读取 ${result.total} 道题，已更新 ${result.indexed} 道题的索引状态。`;
+    await refresh();
+  } catch (error) {
+    message.textContent = error.message;
+  } finally {
+    button.disabled = false;
+  }
 };
 $('#add').onclick = () => {edit={}; dialog('<h2>手动添加题目</h2><form id="question-form">'+fields()+'<button>保存题目</button></form>')};
 $('#close').onclick=()=>$('#editor').close();
