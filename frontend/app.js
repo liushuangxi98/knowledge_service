@@ -57,7 +57,7 @@ async function refresh() {
     ${button('整理草稿','draft',d.id)}${button('删除文档','remove-doc',d.id)}</div></article>`).join('') || '<p>暂无文档。</p>';
   $('#question-list').innerHTML = questions.map(q => {
     const doc = documents.find(d=>d.id===q.document_id);
-    return `<article class="row"><div><h3>${esc(q.question)}</h3><small>${esc(q.tags.join(' · '))} ${q.index_status==='indexed'?'已索引':'待建索引'}</small>
+    return `<article class="row"><div><h3>${esc(q.sort_order)}. ${esc(q.question)}</h3><small>${esc(q.tags.join(' · '))} ${q.index_status==='indexed'?'已索引':'待建索引'}</small>
       <details><summary>答案与来源</summary>${answerHTML(q.answer, '暂无参考答案')}
       ${doc?`<a target="_blank" rel="noopener" href="/api/documents/${encodeURIComponent(doc.id)}/content">${esc(doc.filename)}</a>`:'手动录入'} ${esc(q.locator)}</details></div>
       <div class="actions">${button('编辑','edit',q.question_id)}${button('删除题目','remove-question',q.question_id)}</div></article>`;
@@ -67,8 +67,8 @@ function questionSummary(title, number) {
   return `<summary><span class="draft-number">${number}</span><span class="draft-title">${esc(title || '未填写题干')}</span></summary>`;
 }
 function questionPreview(items) {
-  return `<div class="draft-list">${items.map((q, i) => `<details class="draft-row">
-    ${questionSummary(q.question, i + 1)}<div class="draft-body"><strong>参考答案</strong>
+  return `<div class="draft-list">${items.map(q => `<details class="draft-row">
+    ${questionSummary(q.question, q.sort_order)}<div class="draft-body"><strong>参考答案</strong>
     ${answerHTML(q.answer, '无参考答案')}<small>${esc(q.tags.join(' · '))} ${esc(q.locator)}</small>
     </div></details>`).join('')}</div>`;
 }

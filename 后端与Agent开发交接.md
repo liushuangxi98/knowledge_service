@@ -60,7 +60,7 @@ def parse_questions(document_id: str, source: str) -> list[dict]:
 {"question_ids": ["q_101", "q_102"]}
 ```
 
-这里和下文的 ID 为示意值。实际接口返回最终 ID 的排序去重列表，**不能按返回顺序和提交草稿的位置配对**。索引器应该按 ID 读取正式记录，以用户最后确认或编辑过的文字为准。[入库实现](backend/service.py) · [两张表的定义](backend/database.py)
+这里和下文的 ID 为示意值。确认接口按最终草稿顺序分配文档内题号 sort_order，重复题只保留首次出现的位置；返回的 ID 也按保存的题号排列。索引器应该按 ID 读取正式记录，以用户最后确认或编辑过的文字为准。[入库实现](backend/service.py) · [两张表的定义](backend/database.py)
 
 | 存储字段 | 什么时候写 | 回答的问题 |
 | --- | --- | --- |

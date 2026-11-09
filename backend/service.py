@@ -22,7 +22,7 @@ def show_document(doc):
 
 def show_question(item):
     return {key: getattr(item, key) for key in
-            ('question_id', 'question', 'answer', 'tags', 'document_id', 'locator', 'index_status')}
+            ('question_id', 'question', 'answer', 'tags', 'document_id', 'locator', 'index_status', 'sort_order')}
 
 
 def get_record(session, model, key, *, lock=False):
@@ -92,20 +92,22 @@ class Library:
             backup.unlink()
 
     def questions(self, query, document_id):
-        stmt = select(Question)
+        # 全库列表按来源文档归组；手动题单独一组，每组均按已保存的题号显示。
+        stmt = select(Question).outerjoin(Document).order_by(
+            Document.created_at.desc(), Document.filename, Document.sha256, Question.sort_order)
         if document_id:
             stmt = stmt.where(Question.document_id == document_id)
         if query:
             stmt = stmt.where(Question.question.contains(query, autoescape=True))
         with self.sessions() as session:
-            return [show_question(item) for item in session.scalars(stmt.order_by(Question.question_id))]
+            return [show_question(item) for item in session.scalars(stmt)]
 
     def prepare(self, key):
         """已确认的文档直接读正式题目；只有未确认的文档才需要拆题。"""
         with self.sessions() as session:
             doc = get_record(session, Document, key)
             if doc.questions_llm_confirmed:
-                rows = session.scalars(select(Question).where(Question.document_id == key).order_by(Question.question_id))
+                rows = session.scalars(select(Question).where(Question.document_id == key).order_by(Question.sort_order))
                 return {'status': 'confirmed', 'questions': [show_question(row) for row in rows]}
 
         parser = getattr(parse_questions, 'parse_questions', None)
@@ -121,27 +123,28 @@ class Library:
             if doc.questions_llm_confirmed:
                 # 另一标签页可能已提交了同一文档，旧草稿不会再写入。
                 ids = session.scalars(select(Question.question_id).where(Question.document_id == key)
-                                      .order_by(Question.question_id)).all()
+                                      .order_by(Question.sort_order)).all()
                 return {'question_ids': ids}
-            ids = []
+            ids = {}
             for draft in drafts:
                 # 来源文档、原文位置和题干决定是否为同一题。重复确认保留人工编辑和索引状态。
                 source_key = sha256((draft.locator + '\0' + draft.question).encode()).hexdigest()
-                item = session.scalar(select(Question).where(
-                    Question.document_id == key, Question.source_key == source_key))
-                if item is None:
-                    item = Question(**draft.model_dump(), document_id=key, source_key=source_key)
-                    session.add(item)
-                    session.flush()
-                ids.append(item.question_id)
+                if source_key in ids:
+                    continue
+                item = Question(**draft.model_dump(), document_id=key, source_key=source_key, sort_order=len(ids) + 1)
+                session.add(item)
+                session.flush()
+                ids[source_key] = item.question_id
             # 与题目写入一起提交。只生成草稿、或事务失败时均不标记为已确认。
             doc.questions_llm_confirmed = True
-            return {'question_ids': sorted(set(ids))}
+            return {'question_ids': list(ids.values())}
 
     def save_question(self, data, key=None):
         with self.sessions.begin() as session:
             if key is None:
-                item = Question(**data.model_dump())
+                last = session.scalar(select(Question.sort_order).where(Question.document_id.is_(None))
+                                      .order_by(Question.sort_order.desc()).limit(1).with_for_update())
+                item = Question(**data.model_dump(), sort_order=(last or 0) + 1)
                 session.add(item)
             else:
                 item = get_record(session, Question, key, lock=True)

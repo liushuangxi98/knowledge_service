@@ -189,3 +189,45 @@ def test_failed_confirm_rolls_back_flag_and_questions(library, monkeypatch):
     assert result.status_code == 503
     assert client.get('/api/documents').json()[0]['questions_llm_confirmed'] is False
     assert client.get('/api/questions').json() == []
+
+
+def test_confirm_preserves_draft_order(library):
+    client, settings = library
+    key = upload(client, '顺序.md', b'# order').json()['id']
+    confirm = f'/api/documents/{key}/confirm'
+    drafts = [{'question': q} for q in ('乙题', '甲题', '甲题', '丙题')]
+    ids = client.post(confirm, json={'questions': drafts}).json()['question_ids']
+    with TestClient(create_app(settings)) as reopened:
+        def check(rows):
+            assert [(q['sort_order'], q['question']) for q in rows] == [(1, '乙题'), (2, '甲题'), (3, '丙题')]
+            assert [q['question_id'] for q in rows] == ids
+        check(reopened.get('/api/questions').json())
+        check(reopened.post(f'/api/documents/{key}/prepare').json()['questions'])
+        assert reopened.post(confirm, json={'questions': drafts[::-1]}).json()['question_ids'] == ids
+        assert reopened.get('/api/questions?q=丙').json()[0]['sort_order'] == 3
+        reopened.delete('/api/questions/' + ids[1]).raise_for_status()
+        assert [q['sort_order'] for q in reopened.get('/api/questions').json()] == [1, 3]
+        second = upload(reopened, '另一份.md', b'# other').json()['id']
+        reopened.post(f'/api/documents/{second}/confirm', json={'questions': drafts[:1]}).raise_for_status()
+        assert reopened.get('/api/questions', params={'document_id': second}).json()[0]['sort_order'] == 1
+        for number in (1, 2):
+            manual = reopened.post('/api/questions', json={'question': f'手动 {number}'}).json()
+            assert manual['sort_order'] == number
+
+
+def test_upgrade_numbers_old_questions_once(library):
+    client, settings = library
+    key = upload(client, '旧版.md', b'# legacy-order').json()['id']
+    url = f'/api/documents/{key}/confirm'
+    ids = client.post(url, json={'questions': [{'question': q} for q in ('Z', 'A', 'K')]}).json()['question_ids']
+    engine = make_engine(settings)
+    with engine.begin() as conn:
+        conn.execute(text('ALTER TABLE questions DROP COLUMN sort_order'))
+    engine.dispose()
+    initialize(settings)
+    rows = client.get('/api/questions').json()
+    assert [q['question_id'] for q in rows] == sorted(ids)
+    assert [q['sort_order'] for q in rows] == [1, 2, 3]
+    client.delete('/api/questions/' + rows[0]['question_id']).raise_for_status()
+    initialize(settings)
+    assert [q['sort_order'] for q in client.get('/api/questions').json()] == [2, 3]
