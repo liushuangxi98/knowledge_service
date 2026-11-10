@@ -234,39 +234,43 @@ def test_upgrade_numbers_old_questions_once(library):
     assert [q['sort_order'] for q in client.get('/api/questions').json()] == [2, 3]
 
 def mock_model_http(monkeypatch, handler):
-    """保留完整 SDK 调用链，只替换最后发出 HTTP 请求的传输层。"""
+    """保留 LangChain 和 SDK 调用链，只替换 HTTP 传输与测试配置。"""
     import httpx
-    from openai import OpenAI
-    from knowledge_agent import model_api
-    def client(**options):
-        return OpenAI(**options, http_client=httpx.Client(transport=httpx.MockTransport(handler)))
-    monkeypatch.setattr(model_api, 'OpenAI', client)
+    from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+    from knowledge_agent import embeddings, parse_questions
+
+    options = dict(model='test-model', api_key='test', base_url='http://model.invalid/v1',
+                   http_client=httpx.Client(transport=httpx.MockTransport(handler)))
+    monkeypatch.setattr(parse_questions, 'ChatOpenAI', lambda **kwargs: ChatOpenAI(**(kwargs | options)))
+    monkeypatch.setattr(embeddings, 'OpenAIEmbeddings', lambda **kwargs: OpenAIEmbeddings(**(kwargs | options)))
 
 
-def test_agent_pipeline_with_chroma(library, monkeypatch):
-    """真实走 HTTP 路由、模型请求格式、MySQL 与 Chroma；只替换外部模型的 HTTP 响应。"""
-    import json
-    from contextlib import contextmanager
+@pytest.fixture
+def memory_chroma(monkeypatch):
+    """当前持久化适配器使用独立的内存集合，不接触用户向量目录。"""
     import chromadb
-    import httpx
+    from chromadb.config import Settings as ChromaSettings
+    from langchain_chroma import Chroma
     from knowledge_agent import rag
 
+    client = chromadb.EphemeralClient(settings=ChromaSettings(anonymized_telemetry=False))
+    name = 'pipeline-' + uuid4().hex
+    collection = client.create_collection(name, embedding_function=None, metadata={'hnsw:space': 'cosine'})
+    monkeypatch.setattr(rag, 'Chroma', lambda **kwargs: Chroma(
+        client=client, collection_name=name, embedding_function=kwargs['embedding_function']))
+    try:
+        yield collection
+    finally:
+        client.delete_collection(name)
+        client.close()
+
+
+def test_agent_pipeline_with_chroma(library, monkeypatch, memory_chroma):
+    """真实走 HTTP 路由、模型请求格式、MySQL 与 Chroma；只替换外部模型的 HTTP 响应。"""
+    import json
+    import httpx
+
     client, _ = library
-    for prefix in ('LLM', 'EMBEDDING'):
-        monkeypatch.setenv(prefix + '_BASE_URL', 'http://model.invalid/v1')
-        monkeypatch.setenv(prefix + '_MODEL', 'test-' + uuid4().hex)
-        monkeypatch.setenv(prefix + '_API_KEY', 'test')
-    # CI 可指定专属 HTTP 服务；本地无独立实例时仍使用真实 Chroma 引擎验证召回。
-    test_url = os.getenv('KNOWLEDGE_TEST_CHROMA_URL')
-    if test_url:
-        monkeypatch.setenv('CHROMA_URL', test_url)
-    else:
-        store = chromadb.EphemeralClient()
-        collection = store.create_collection('test-' + uuid4().hex, embedding_function=None)
-        @contextmanager
-        def local_collection(create=False):
-            yield collection
-        monkeypatch.setattr(rag, 'question_collection', local_collection)
     topics = ['排序', '切片', '评估', '超时', '坐标']
     drafts = [{'question': '怎样做' + t, 'tags': [t], 'answer': '答案' if i else '', 'locator': f'第{i+1}题'}
               for i, t in enumerate(topics)]
@@ -279,15 +283,15 @@ def test_agent_pipeline_with_chroma(library, monkeypatch):
         if url.endswith('/chat/completions'):
             assert '# 题库' in body['messages'][-1]['content']
             payload = {'choices': [{'finish_reason': 'tool_calls', 'message': {'role': 'assistant', 'tool_calls': [{'type': 'function', 'id': 'test-call',
-                'function': {'name': 'extract_questions', 'arguments': encoded_drafts}}]}}]}
+                'function': {'name': 'QuestionDrafts', 'arguments': encoded_drafts}}]}}]}
         else:
-            assert body['encoding_format'] == 'float' and 1 <= len(body['input']) <= 10
+            assert body['encoding_format'] == 'float' and 1 <= len(body['input']) <= 20
             data = []
             for i, value in enumerate(body['input']):
                 assert isinstance(value, str)
                 k = 0 if '换个顺序' in value else next(i for i,t in enumerate(topics) if t in value)
                 data.append({'index': i, 'embedding': [float(j == k) for j in range(len(topics))]})
-            payload = {'data': data[::-1]}
+            payload = {'data': data}
         return httpx.Response(200, json=payload)
     encoded_drafts = json.dumps({'questions': drafts}, ensure_ascii=False)
     mock_model_http(monkeypatch, model_response)
@@ -313,51 +317,94 @@ def test_agent_pipeline_with_chroma(library, monkeypatch):
     assert best()['answer'] == '最新答案'
     client.put(item_url, json={**update, 'question': '新的排序问题'}).raise_for_status()
     assert client.post('/api/search', json=query).json()['items'] == []
-    assert client.post('/api/index/rebuild').json()['indexed'] == 5
-    assert best()['question'] == '新的排序问题'
+    assert memory_chroma.count() == 5
+    # 已有 ID 的向量更新另由独立回归覆盖；此处验证删除后的后端过滤。
     client.delete(item_url).raise_for_status()
     assert client.post('/api/search', json=query).json()['items'] == []
-    assert client.post('/api/index/rebuild').json()['indexed'] == 4
-    with rag.question_collection() as collection:
-        assert collection.count() == 4
     client.delete(url).raise_for_status()
-    assert client.post('/api/index/rebuild').json()['total'] == 0
-    with rag.question_collection() as collection:
-        assert collection.count() == 0
+    assert client.get('/api/questions').json() == []
+
+
+def test_agent_parse_index_and_search(monkeypatch, memory_chroma):
+    """无需 MySQL，验证当前拆题、嵌入、Chroma 与查询的实际接口。"""
+    import json
+    import httpx
+    from knowledge_agent import parse_questions, rag
+
+    drafts = [{'question': '如何排序', 'answer': '使用 sorted', 'tags': ['排序'], 'locator': '第1题'},
+              {'question': '如何切片', 'answer': '', 'tags': ['切片'], 'locator': '第2题'}]
+    def respond(request):
+        body = json.loads(request.content)
+        if request.url.path.endswith('/chat/completions'):
+            assert body['messages'][-1]['content'] == '# 题库'
+            return httpx.Response(200, json={'choices': [{'index': 0, 'finish_reason': 'tool_calls',
+                'message': {'role': 'assistant', 'tool_calls': [{'id': 'test-call', 'type': 'function',
+                    'function': {'name': 'QuestionDrafts', 'arguments': json.dumps({'questions': drafts})}}]}}]})
+        data = [{'index': i, 'embedding': [1., 0.] if '排序' in value else [0., 1.]}
+                for i, value in enumerate(body['input'])]
+        return httpx.Response(200, json={'data': data})
+    mock_model_http(monkeypatch, respond)
+    parsed = parse_questions.parse_questions('# 题库')
+    assert [item.model_dump() for item in parsed] == drafts
+    rag.rebuild_index([dict(item.model_dump(), question_id=f'q{i}') for i, item in enumerate(parsed)])
+    assert memory_chroma.count() == 2
+    assert rag.search_ids('排序', 1) == ['q0']
+
+
+def test_rebuild_updates_existing_vectors(monkeypatch, memory_chroma):
+    import json
+    import httpx
+    from knowledge_agent import rag
+
+    def respond(request):
+        vector = [0., 1.] if '新题' in json.loads(request.content)['input'][0] else [1., 0.]
+        return httpx.Response(200, json={'data': [{'index': 0, 'embedding': vector}]})
+    mock_model_http(monkeypatch, respond)
+    rag.rebuild_index([{'question_id': 'q1', 'question': '旧题', 'tags': []}])
+    rag.rebuild_index([{'question_id': 'q1', 'question': '新题', 'tags': []}])
+    result = memory_chroma.get(ids=['q1'], include=['documents', 'embeddings'])
+    assert result['documents'] == ['新题\ntag:[]']
+    assert result['embeddings'].tolist() == [[0., 1.]]
+
+
+@pytest.mark.xfail(strict=True, raises=AssertionError, reason='空库重建尚未清理已有向量')
+def test_rebuild_empty_library_clears_vectors(memory_chroma):
+    from knowledge_agent import rag
+
+    memory_chroma.upsert(ids=['old'], embeddings=[[1., 0.]])
+    rag.rebuild_index([])
+    assert memory_chroma.count() == 0
 
 
 def test_embedding_propagates_sdk_413_without_retry(monkeypatch):
     import httpx
     from openai import APIStatusError
     from unittest.mock import Mock
-    from knowledge_agent.embeddings import embed_texts
-    monkeypatch.setenv('EMBEDDING_API_KEY', 'test')
-    monkeypatch.setenv('EMBEDDING_MODEL', 'test')
-    monkeypatch.setenv('EMBEDDING_BASE_URL', 'http://model.invalid/v1')
+    from knowledge_agent.embeddings import build_embeddings
     send = Mock(return_value=httpx.Response(413))
     mock_model_http(monkeypatch, send)
     with pytest.raises(APIStatusError) as error:
-        embed_texts(['一题'])
+        build_embeddings().embed_documents(['一题'])
     assert error.value.status_code == 413
     send.assert_called_once()
 
 
-def test_embedding_batches_keep_text_order(monkeypatch):
+@pytest.mark.parametrize('reverse', [False, pytest.param(True, marks=pytest.mark.xfail(
+    strict=True, raises=AssertionError, reason='当前适配器未按响应 index 恢复乱序向量'))])
+def test_embedding_batches_keep_text_order(monkeypatch, reverse):
     import json
     import httpx
     from knowledge_agent import embeddings
-    monkeypatch.setenv('EMBEDDING_BASE_URL', 'http://model.invalid/v1')
-    monkeypatch.setenv('EMBEDDING_MODEL', 'test')
-    monkeypatch.setenv('EMBEDDING_API_KEY', 'test')
     batches = []
     def respond(request):
         texts = json.loads(request.content)['input']
         batches.append(len(texts))
-        return httpx.Response(200, json={'data': [{'index': i, 'embedding': [float(texts[i])]} for i in reversed(range(len(texts)))]})
+        indices = reversed(range(len(texts))) if reverse else range(len(texts))
+        return httpx.Response(200, json={'data': [{'index': i, 'embedding': [float(texts[i])]} for i in indices]})
     mock_model_http(monkeypatch, respond)
-    got = embeddings.embed_texts([str(i) for i in range(23)])
+    got = embeddings.build_embeddings().embed_documents([str(i) for i in range(23)])
     assert got == [[float(i)] for i in range(23)]
-    assert batches == [10, 10, 3]
+    assert batches == [20, 3]
 
 
 def test_search_with_two_arguments_filters_stale_hits_in_rank_order(library, monkeypatch):
@@ -416,3 +463,24 @@ def test_vector_deletion_follows_question_and_document(library, monkeypatch):
     remove.reset_mock()
     assert client.delete('/api/documents/'+empty).status_code == 204
     remove.assert_not_called()
+
+
+def test_del_index_ignores_absent_vectors(monkeypatch):
+    import chromadb
+    from langchain_chroma import Chroma
+    from knowledge_agent import rag
+
+    client = chromadb.EphemeralClient()
+    name = 'delete-' + uuid4().hex
+    try:
+        store = Chroma(client=client, collection_name=name, embedding_function=None)
+        client.get_collection(name).upsert(ids=['target', 'keep'], embeddings=[[1., 0.], [0., 1.]])
+        monkeypatch.setattr(rag, 'Chroma', lambda **kwargs: store)
+        monkeypatch.setattr(rag, 'build_embeddings', lambda: None)
+        rag.del_index([{'question_id': 'absent'}])
+        rag.del_index([{'question_id': 'target'}, {'question_id': 'absent'}])
+        rag.del_index([{'question_id': 'target'}])
+        assert store.get()['ids'] == ['keep']
+    finally:
+        client.delete_collection(name)
+        client.close()

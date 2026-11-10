@@ -1,4 +1,6 @@
 """维护和查询独立 Chroma 服务。输入最终题目 ID 和向量以同步索引；输入考点和数量以召回 ID，再从 MySQL 返回有效的题目、答案和出处。"""
+from hashlib import sha256
+
 from langchain_core.documents import Document
 from chromadb.config import Settings as ChromadbSettings
 from langchain_chroma import Chroma
@@ -8,8 +10,6 @@ from .embeddings import build_embeddings
 
 def rebuild_index(questions):
     settings = Settings()
-    # 取文档和id
-    documents_dict = {i['question_id']: Document(page_content=i['question'] + f"tag:{i['tags']}") for i in questions}
     # 向量库
     chroma_database_version = settings.get_chroma_database_version()
     chroma_store = Chroma(
@@ -18,9 +18,25 @@ def rebuild_index(questions):
         persist_directory=str(settings.chroma_dir),
         collection_metadata={"hnsw:space": "cosine"}
     )
+
+    # 对实际用于向量化的文本计算哈希。
+    documents_dict = {i['question_id']: Document(
+        page_content=f"{i['question']}\ntag:{i['tags']}",
+        metadata={'content_hash': sha256(f"{i['question']}\ntag:{i['tags']}".encode("utf-8")).hexdigest()}
+    )  for i in questions}
+
     # 去重添加文档
-    need_add_ids = list(set(documents_dict.keys()) - set(chroma_store.get()["ids"]))
-    chroma_store.add_documents([documents_dict[i] for i in need_add_ids], ids=need_add_ids)
+    old_documents = chroma_store.get()
+    old_documents_ids_map_metadata = dict(zip(old_documents['ids'], old_documents['metadatas']))
+    # 通过集合取出新增的和重叠的
+    need_add_ids = list(set(documents_dict.keys()) - set(old_documents["ids"]))
+    need_modify_ids = list(set(documents_dict.keys()) & set(old_documents["ids"]))
+    # 检查重叠的内容hash是不是一致
+    for i in need_modify_ids:
+        if documents_dict[i].metadata['content_hash'] != old_documents_ids_map_metadata[i]['content_hash']:
+            need_add_ids.append(i)
+    if need_add_ids:
+        chroma_store.add_documents([documents_dict[i] for i in need_add_ids], ids=need_add_ids)
 
 def del_index(questions):
     settings = Settings()
@@ -35,7 +51,9 @@ def del_index(questions):
         collection_metadata={"hnsw:space": "cosine"}
     )
     # 交集删除
-    chroma_store.delete(list(set(need_del_ids) & set(chroma_store.get()["ids"])))
+    existing_ids = set(need_del_ids) & set(chroma_store.get()["ids"])
+    if existing_ids:
+        chroma_store.delete(list(existing_ids))
 
 def search_ids(topic: str, limit: int):
     settings = Settings()

@@ -26,7 +26,7 @@ class Settings(BaseSettings):
     embedding_api_key: SecretStr = Field(title='嵌入式模型密钥', default=SecretStr(''))
     embedding_base_url: str = Field(title='嵌入式服务地址', default='')
 
-    chroma_dir: Path = ROOT / 'chroma'
+    chroma_dir: Path = ROOT / 'data' / 'chroma'
 
     def get_chroma_database_version(self):
         identity = self.embedding_model + ':' + self.embedding_base_url
