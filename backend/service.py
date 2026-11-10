@@ -1,22 +1,15 @@
 """文档原件、已确认题目和索引状态的存储。拆题和检索由 knowledge_agent 接入。"""
-import json
 from hashlib import sha256
 from pathlib import Path
 from threading import Lock
 from uuid import uuid4
 
 from fastapi import HTTPException
-from pydantic import ValidationError
 from sqlalchemy import delete, select
 from sqlalchemy.dialects.mysql import insert
 
 from knowledge_agent import parse_questions, rag
 from .database import Document, DocumentDraft, Question, QuestionCounter
-from .schemas import QuestionDrafts
-
-
-# 为模型请求的系统消息、工具结构和协议字段保留 1 MiB；按序列化字节检查，不按 token 估算。
-MAX_PARSE_INPUT_BYTES = 47 * 1024**2
 
 
 def show_document(doc, has_drafts=False):
@@ -38,11 +31,10 @@ def get_record(session, model, key, *, lock=False):
 
 
 class Library:
-    def __init__(self, sessions, originals, parse_batch_size):
+    def __init__(self, sessions, originals):
         self.sessions = sessions
         self.originals = Path(originals)
         self.index_lock = Lock()
-        self.parse_batch_size = parse_batch_size
 
     def documents(self):
         with self.sessions() as session:
@@ -69,6 +61,7 @@ class Library:
                 has_drafts = session.scalar(select(DocumentDraft.document_id).where(DocumentDraft.document_id == doc.id))
                 return {**show_document(doc, has_drafts is not None), 'reused': doc.id != new_id}
         except Exception:
+            # 数据库写入失败时，移除本次创建的原件。
             if new_file:
                 new_file.unlink(missing_ok=True)
             raise
@@ -132,29 +125,17 @@ class Library:
             return [show_question(item) for item in session.scalars(stmt)]
 
     def prepare(self, key):
-        return self.prepare_batch([key])['documents'][0]
+        result = self.prepare_batch([key])
+        if not result['documents']:
+            raise HTTPException(result['status_code'] if result['status_code'] != 200 else 502, result['error'])
+        return result['documents'][0]
 
     def prepare_batch(self, keys):
-        """按配置分批，成功后单独提交草稿，失败即停止。"""
-        keys = list(dict.fromkeys(keys))
-        results = []
-        size = self.parse_batch_size
-        for start in range(0, len(keys), size):
-            try:
-                group = self._prepare_group(keys[start:start + size])
-            except HTTPException as exc:
-                message = f'第 {start // size + 1} 批整理失败：{exc.detail}'
-                if results:
-                    message += f'；前 {len(results)} 份文档的结果已保存，可继续复用。'
-                raise HTTPException(exc.status_code, message) from exc
-            results.extend(group['documents'])
-        return {'documents': results}
-
-    def _prepare_group(self, keys):
-        """已确认文档和已有草稿直接复用，其余原文交给 Agent。"""
+        """读取已有结果，一次调用 Agent，统一保存返回的成功草稿。"""
         keys = list(dict.fromkeys(keys))
         results, sources = {}, []
         with self.sessions.begin() as session:
+            # 1. 锁住所选文档，复用正式题目或已有草稿。
             docs = self._lock_documents(session, keys)
             for key in keys:
                 doc = docs[key]
@@ -168,33 +149,18 @@ class Library:
                 else:
                     sources.append({'document_id': key, 'filename': doc.filename,
                                     'source': self._read_original(key).decode('utf-8-sig')})
+            # 只把首次整理的原文交给 Agent；失败批次由 Agent 排除。
+            outcome = {'documents': [], 'error': None, 'status_code': 200}
             if sources:
-                payload = json.dumps({'documents': sources}, ensure_ascii=False)
-                if len(json.dumps(payload, ensure_ascii=True).encode('utf-8')) > MAX_PARSE_INPUT_BYTES:
-                    raise HTTPException(413, '合并原文过大，请减少所选文档；本轮已停止，不会自动拆批重试')
-                try:
-                    drafts = [QuestionDrafts.model_validate(item) for item in parse_questions.parse_questions(sources)]
-                except parse_questions.DraftParseError as exc:
-                    raise HTTPException(502, str(exc)) from exc
-                except ValidationError as exc:
-                    raise HTTPException(502, parse_questions.field_error(exc)) from exc
-                names = {s['document_id']: s['filename'] for s in sources}
-                returned = [draft.document_id for draft in drafts]
-                if len(returned) != len(set(returned)) or set(returned) != names.keys():
-                    missing = [name for key, name in names.items() if key not in returned]
-                    issues = []
-                    if missing:
-                        issues.append('缺少 ' + '、'.join(missing))
-                    if len(returned) != len(set(returned)):
-                        issues.append('重复返回文档 ID')
-                    if set(returned) - names.keys():
-                        issues.append('返回了本次未送入模型的文档 ID')
-                    raise HTTPException(502, '模型返回的文档分组有误：' + '；'.join(issues))
-                for draft in drafts:
-                    group = draft.model_dump()
-                    session.add(DocumentDraft(document_id=draft.document_id, questions=group['questions']))
-                    results[draft.document_id] = {**group, 'status': 'draft'}
-        return {'documents': [results[key] for key in keys]}
+                outcome = parse_questions.parse_questions(sources)
+                # 2. Agent 已完成结构和文档归属校验，统一保存返回的成功结果。
+                for group in outcome['documents']:
+                    key = group['document_id']
+                    session.add(DocumentDraft(document_id=key, questions=group['questions']))
+                    results[key] = {**group, 'status': 'draft'}
+        # 3. 事务成功后，按选择顺序返回可预览的结果及失败提示。
+        return {'documents': [results[key] for key in keys if key in results],
+                'error': outcome['error'], 'status_code': outcome['status_code']}
 
     @staticmethod
     def _lock_documents(session, keys):
@@ -216,6 +182,7 @@ class Library:
             raise HTTPException(422, '请提交一份或多份不同文档的草稿')
         ids = []
         with self.sessions.begin() as session:
+            # 1. 锁定文档和全库题号，整批写入使用同一个事务。
             docs = self._lock_documents(session, keys)
             counter = self._number_counter(session)
             for group in groups:
@@ -224,6 +191,7 @@ class Library:
                     ids.extend(session.scalars(select(Question.question_id).where(Question.document_id == doc.id)
                                                .order_by(Question.sort_order)))
                     continue
+                # 2. 按用户核对的顺序入库，已确认文档直接复用原 ID。
                 seen = set()
                 for draft in group.questions:
                     source_key = sha256((draft.locator + '\0' + draft.question).encode()).hexdigest()
@@ -236,6 +204,7 @@ class Library:
                     session.add(item)
                     session.flush()
                     ids.append(item.question_id)
+                # 3. 标记文档已确认并移除草稿，随正式题目一起提交。
                 doc.questions_llm_confirmed = True
                 session.execute(delete(DocumentDraft).where(DocumentDraft.document_id == doc.id))
         return {'question_ids': ids}
@@ -261,7 +230,7 @@ class Library:
         if not self.index_lock.acquire(blocking=False):
             raise HTTPException(409, '全量重建正在进行中')
         try:
-            # 传全部正式题目。空库也传 []，供 Agent 清理已删除题目的旧向量。
+            # 1. 读取全库正式题目，交给 Agent 更新向量。
             questions = self.questions('', None)
             try:
                 rag.rebuild_index(questions)
@@ -273,7 +242,7 @@ class Library:
                     raise HTTPException(413, '向量请求超过大小限制，本次重建已停止') from None
                 raise HTTPException(502, '全量重建失败，请检查 Embedding 和 Chroma 服务') from None
 
-            # 网络调用结束后才开写事务。重建期间有编辑的题目留待下一次手动重建。
+            # 2. 向量操作结束后再回写状态，期间改动的题目保持待索引。
             snapshot = {q['question_id']: (q['question'], q['tags']) for q in questions}
             indexed = 0
             with self.sessions.begin() as session:
@@ -300,6 +269,7 @@ class Library:
 
     def remove_questions(self, keys):
         with self.index_lock, self.sessions.begin() as session:
+            # 先锁定全部所选题目，再一次删除对应向量；异常会回滚本次 SQL 删除。
             keys = set(keys)
             rows = session.scalars(select(Question).where(Question.question_id.in_(keys))
                                    .order_by(Question.question_id).with_for_update()).all()

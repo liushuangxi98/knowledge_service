@@ -16,11 +16,11 @@
 
 ## 1. 拆题：批量输入与分组输出
 
-同步入口为 `parse_questions(documents: list[dict]) -> list[dict]`，单文件也使用一个元素的列表。
+同步入口为 `parse_questions(documents: list[dict]) -> dict`，单文件也使用一个元素的列表。
 
-输入的每项含 `document_id`、`filename`、`source`。Agent 一次模型调用处理整批原文，使用 `BatchQuestionDrafts` 包装 `QuestionDrafts` 列表；`QuestionDrafts` 含原样返回的 `document_id` 和 `questions: list[QuestionInput]`。每份文档独立提取题干、原文答案、标签和 locator，没有题目允许空列表，不跨文档合并。模型解析失败向上抛错，不返回空列表冒充成功。
+输入的每项含 `document_id`、`filename`、`source`。Agent 在 parse_questions 内按配置分批，每批一次模型调用，使用 `BatchQuestionDrafts` 包装 `QuestionDrafts` 列表；`QuestionDrafts` 含原样返回的 `document_id` 和 `questions: list[QuestionInput]`。每份文档独立提取题干、原文答案、标签和 locator，没有题目允许空列表，不跨文档合并。失败批次不纳入成功结果，parse_questions 返回此前成功的完整批次和错误说明。
 
-后端 `POST /api/documents/prepare-batch` 接收 `document_ids`，重复 ID 去重。已确认文档直接读 MySQL；已整理草稿直接复用，首次整理的原文按每批按 .env 的 PARSE_BATCH_SIZE（当前为 20）交给 Agent，每批草稿独立提交，失败即停止。后端检查输出分组不存在缺失、重复或未知 ID，按输入顺序返回 `documents`，各项含 `document_id`、`status` 和 `questions`。单文档 prepare 复用同一业务方法。合并原文按序列化字节检查，超限在模型调用前停止，413 不自动重试。
+后端 `POST /api/documents/prepare-batch` 接收 `document_ids`，重复 ID 去重。已确认文档直接读 MySQL；已整理草稿直接复用，首次整理文档一次交给 parse_questions，由函数内部按 .env 的 PARSE_BATCH_SIZE（当前为 20）划分并调用模型，parse_questions 在函数内累加成功批次并返回 documents、error、status_code。失败即停止，后端统一提交返回的成功草稿。后端检查输出分组不存在缺失、重复或未知 ID，按输入顺序返回 `documents`，各项含 `document_id`、`status` 和 `questions`。单文档 prepare 复用同一业务方法。模型请求遇到 413 即停止，不自动重试。
 
 前端按文件切换编辑和预览，通过 /api/documents/confirm-batch 一次确认本批全部待入库文档。单文档接口使用 `/api/documents/{id}/confirm`，请求体需要 `document_id` 与路径一致，以及 `questions` 列表。空结果也可确认。题目字段约束以 `backend/schemas.py` 为准。
 

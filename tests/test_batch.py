@@ -17,7 +17,7 @@ def test_prepare_batch_groups_sources_and_reuses_confirmed(library, monkeypatch)
     assert upload(client, 'duplicate.md', b'# A').json()['id'] == a
     parser = Mock(return_value=[{'document_id': b, 'questions': []},
                                {'document_id': a, 'questions': [{'question': 'A1'}, {'question': 'A2'}]}])
-    monkeypatch.setattr(parse_questions, 'parse_questions', parser)
+    monkeypatch.setattr(parse_questions, '_parse_batch', parser)
     result = client.post('/api/documents/prepare-batch', json={'document_ids': [a, b, a]})
     result.raise_for_status()
     assert [d['document_id'] for d in result.json()['documents']] == [a, b]
@@ -41,10 +41,14 @@ def test_prepare_batch_rejects_invalid_groups(library, monkeypatch, returned):
     b = upload(client, 'b.md', b'# B').json()['id']
     ids = {'missing': [a], 'unknown': [a, 'other'], 'duplicate': [a, a], 'invalid': [a, b]}[returned]
     groups = [{'document_id': key, 'questions': [{'question': ''}] if returned == 'invalid' else []} for key in ids]
-    monkeypatch.setattr(parse_questions, 'parse_questions', Mock(return_value=groups))
+    mock_model_http(monkeypatch, lambda request: httpx.Response(200, json={'choices': [{
+        'index': 0, 'finish_reason': 'tool_calls', 'message': {'role': 'assistant', 'tool_calls': [{
+            'id': 'test', 'type': 'function', 'function': {'name': 'BatchQuestionDrafts',
+                'arguments': json.dumps({'documents': groups})}}]}}]}))
     response = client.post('/api/documents/prepare-batch', json={'document_ids': [a, b]})
-    assert response.status_code == 502
-    assert {'missing':'b.md', 'unknown':'本次未送入模型', 'duplicate':'重复返回', 'invalid':'questions.0.question'}[returned] in response.json()['detail']
+    assert response.status_code == 200
+    assert ('未返回拆题结果' if returned == 'invalid' else '文档分组有误') in response.json()['error']
+    assert response.json()['documents'] == []
     assert client.get('/api/questions').json() == []
     assert all(not d['questions_llm_confirmed'] for d in client.get('/api/documents').json())
 
@@ -58,7 +62,7 @@ def test_prepare_batch_mixed_confirmation_and_id_validation(library, monkeypatch
     assert client.post(f'/api/documents/{a}/confirm', json={'questions': []}).status_code == 422
     client.post(f'/api/documents/{a}/confirm', json=body).raise_for_status()
     parser = Mock(return_value=[{'document_id': b, 'questions': []}])
-    monkeypatch.setattr(parse_questions, 'parse_questions', parser)
+    monkeypatch.setattr(parse_questions, '_parse_batch', parser)
     result = client.post('/api/documents/prepare-batch', json={'document_ids': [a, b]}).json()
     assert [d['status'] for d in result['documents']] == ['confirmed', 'draft']
     parser.assert_called_once_with([{'document_id': b, 'filename': 'b.md', 'source': '# B'}])
@@ -106,16 +110,26 @@ def test_agent_parses_two_documents_in_one_model_call(monkeypatch):
                 'name': 'BatchQuestionDrafts', 'arguments': json.dumps({'documents': outputs})}}]}}]})
     response = Mock(side_effect=respond)
     mock_model_http(monkeypatch, response)
-    assert parse_questions.parse_questions(inputs) == outputs
+    assert parse_questions.parse_questions(inputs) == {'documents': outputs, 'error': None, 'status_code': 200}
     assert response.call_count == 1
 
 
-def test_agent_parse_error_is_not_an_empty_success(monkeypatch):
-    mock_model_http(monkeypatch, lambda request: httpx.Response(200, json={'choices': [{'index': 0,
-        'finish_reason': 'tool_calls', 'message': {'role': 'assistant', 'tool_calls': [{'id': 'invalid',
-            'type': 'function', 'function': {'name': 'BatchQuestionDrafts', 'arguments': '{bad json'}}]}}]}))
-    with pytest.raises(parse_questions.DraftParseError, match='JSON 损坏'):
-        parse_questions.parse_questions([{'document_id': 'a', 'filename': 'a.md', 'source': '# A'}])
+@pytest.mark.parametrize(('arguments', 'message'), [
+    ('{bad json', '未返回拆题结果'),
+    (None, '未返回拆题结果'),
+    (json.dumps({'documents': [{'document_id': 'a', 'questions': [{'question': ''}]}]}), '未返回拆题结果'),
+])
+def test_agent_parse_error_is_not_an_empty_success(monkeypatch, arguments, message):
+    def respond(request):
+        content = {'role': 'assistant', 'content': ''}
+        if arguments is not None:
+            content['tool_calls'] = [{'id': 'invalid', 'type': 'function', 'function': {
+                'name': 'BatchQuestionDrafts', 'arguments': arguments}}]
+        return httpx.Response(200, json={'choices': [{'index': 0,
+            'finish_reason': 'tool_calls' if arguments is not None else 'stop', 'message': content}]})
+    mock_model_http(monkeypatch, respond)
+    result = parse_questions.parse_questions([{'document_id': 'a', 'filename': 'a.md', 'source': '# A'}])
+    assert result['documents'] == [] and message in result['error']
 
 
 def test_batch_delete_cleans_actual_vectors(library, monkeypatch, memory_chroma):
@@ -127,18 +141,6 @@ def test_batch_delete_cleans_actual_vectors(library, monkeypatch, memory_chroma)
     assert client.post('/api/questions/batch-delete', json={'question_ids': ids[:2]}).json() == {'deleted': 2}
     assert memory_chroma.get()['ids'] == ids[2:]
     assert [q['question_id'] for q in client.get('/api/questions').json()] == ids[2:]
-
-
-def test_large_batch_stops_before_model(library, monkeypatch):
-    from backend import service
-    client, _ = library
-    key = upload(client, 'a.md', b'# A').json()['id']
-    parser = Mock()
-    monkeypatch.setattr(parse_questions, 'parse_questions', parser)
-    monkeypatch.setattr(service, 'MAX_PARSE_INPUT_BYTES', 1)
-    result = client.post('/api/documents/prepare-batch', json={'document_ids': [key]})
-    assert result.status_code == 413
-    parser.assert_not_called()
 
 
 def test_index_loads_updated_script_after_upgrade(tmp_path, monkeypatch):
@@ -170,7 +172,7 @@ def test_drafts_reused_and_confirmed_as_one_batch(library, monkeypatch):
     a, b = [upload(client, name+'.md', name.encode()).json()['id'] for name in ['A', 'B']]
     parser = Mock(side_effect=lambda docs: [{'document_id': d['document_id'], 'questions': [
         {'question': d['source']+'1'}, {'question': d['source']+'2'}]} for d in docs])
-    monkeypatch.setattr(parse_questions, 'parse_questions', parser)
+    monkeypatch.setattr(parse_questions, '_parse_batch', parser)
     assert parser.call_count == 0
     prepare = '/api/documents/prepare-batch'
     client.post(prepare, json={'document_ids': [a]}).raise_for_status()
@@ -229,7 +231,7 @@ def test_many_selected_files_send_only_new_sources_and_report_truncation(library
         return client.post('/api/documents/prepare-batch', json={'document_ids': keys})
     prepare(ids[1:3]).raise_for_status()
     failed = prepare(ids)
-    assert failed.status_code == 502 and '截断' in failed.json()['detail']
+    assert failed.status_code == 200 and '截断' in failed.json()['error']
     assert batches == [ids[1:3], ids[3:6]]
     result = prepare(ids).json()['documents']
     assert [d['document_id'] for d in result] == ids
@@ -242,7 +244,7 @@ def test_many_selected_files_send_only_new_sources_and_report_truncation(library
 def test_output_limit_passed_directly_from_env(tmp_path, monkeypatch, limit):
     from knowledge_agent.config import Settings
     env = tmp_path / '.env'
-    env.write_text(f'LLM_MAX_TOKENS={limit}', encoding='utf-8')
+    env.write_text(f'LLM_MAX_TOKENS={limit}\nPARSE_BATCH_SIZE=20', encoding='utf-8')
     monkeypatch.delenv('LLM_MAX_TOKENS', raising=False)
     config = Settings(_env_file=env)
     assert config.llm_max_tokens == limit
@@ -255,8 +257,8 @@ def test_output_limit_passed_directly_from_env(tmp_path, monkeypatch, limit):
                 'name':'BatchQuestionDrafts','arguments':json.dumps({'documents':[{'document_id':'a','questions':[]}]})
             }}]}}]})
     mock_model_http(monkeypatch, respond)
-    assert parse_questions.parse_questions([{'document_id':'a','filename':'a.md','source':'# A'}]) == [
-        {'document_id':'a','questions':[]}]
+    assert parse_questions.parse_questions([{'document_id':'a','filename':'a.md','source':'# A'}]) == {
+        'documents': [{'document_id':'a','questions':[]}], 'error': None, 'status_code': 200}
 
 
 def test_later_batch_failure_preserves_previous_batch(library, monkeypatch):
@@ -267,13 +269,14 @@ def test_later_batch_failure_preserves_previous_batch(library, monkeypatch):
         batch = [d['document_id'] for d in docs]
         batches.append(batch)
         if len(batches) == 2:
-            raise parse_questions.DraftParseError('JSON 损坏')
+            raise ValueError('JSON 损坏')
         return [{'document_id': key, 'questions': []} for key in batch]
-    monkeypatch.setattr(parse_questions, 'parse_questions', parse)
+    monkeypatch.setattr(parse_questions, '_parse_batch', parse)
     def prepare():
         return client.post('/api/documents/prepare-batch', json={'document_ids': ids})
     failure = prepare()
-    assert failure.status_code == 502 and '前 3 份' in failure.json()['detail']
+    assert failure.status_code == 200 and '第 2 批' in failure.json()['error']
+    assert [d['document_id'] for d in failure.json()['documents']] == ids[:3]
     assert batches == [ids[:3], ids[3:6]]
     assert sum(d['has_drafts'] for d in client.get('/api/documents').json()) == 3
     result = prepare().json()['documents']
@@ -295,12 +298,10 @@ def test_batch_413_stops_without_retry(library, monkeypatch):
 
 @pytest.mark.parametrize('size', [20, 4])
 def test_parse_batch_size_loaded_from_env(library, monkeypatch, tmp_path, size):
-    from backend.config import Settings
-    from backend.app import create_app
-    from fastapi.testclient import TestClient
-    client, settings = library
+    from knowledge_agent.config import Settings
+    client, _ = library
     env = tmp_path / '.env'
-    env.write_text(f'PARSE_BATCH_SIZE={size}', encoding='utf-8')
+    env.write_text(f'PARSE_BATCH_SIZE={size}\nLLM_MAX_TOKENS=393216', encoding='utf-8')
     monkeypatch.delenv('PARSE_BATCH_SIZE', raising=False)
     config = Settings(_env_file=env)
     assert config.parse_batch_size == size
@@ -310,9 +311,44 @@ def test_parse_batch_size_loaded_from_env(library, monkeypatch, tmp_path, size):
         batch = [d['document_id'] for d in docs]
         batches.append(batch)
         return [{'document_id': key, 'questions': []} for key in batch]
-    monkeypatch.setattr(parse_questions, 'parse_questions', parse)
-    with TestClient(create_app(settings.model_copy(update={'parse_batch_size':config.parse_batch_size}))) as app:
-        result = app.post('/api/documents/prepare-batch', json={'document_ids': ids})
-        result.raise_for_status()
+    monkeypatch.setattr(parse_questions, '_parse_batch', parse)
+    monkeypatch.setattr(parse_questions, 'settings', config)
+    result = client.post('/api/documents/prepare-batch', json={'document_ids': ids})
+    result.raise_for_status()
     assert batches == [ids[i:i+size] for i in range(0,len(ids),size)]
     assert [d['document_id'] for d in result.json()['documents']] == ids
+
+
+def test_partial_results_can_be_confirmed_together(library, monkeypatch):
+    client, _ = library
+    ids = [upload(client, f'{i}.md', f'# {i}'.encode()).json()['id'] for i in range(7)]
+    calls = []
+    def parse(docs):
+        calls.append(docs)
+        if len(calls) == 2:
+            raise ValueError('bad json')
+        return [{'document_id': d['document_id'], 'questions': [{'question': d['source']}]} for d in docs]
+    monkeypatch.setattr(parse_questions, '_parse_batch', parse)
+    result = client.post('/api/documents/prepare-batch', json={'document_ids': ids}).json()
+    assert result['error'] and len(result['documents']) == 3 and len(calls) == 2
+    assert client.get('/api/questions').json() == []
+    client.post('/api/documents/confirm-batch', json={'documents': result['documents']}).raise_for_status()
+    assert len(client.get('/api/questions').json()) == 3
+
+
+def test_413_returns_saved_successes_and_stops(library, monkeypatch):
+    client, _ = library
+    ids = [upload(client, f'{i}.md', f'# {i}'.encode()).json()['id'] for i in range(7)]
+    calls = []
+    def parse(docs):
+        calls.append(docs)
+        if len(calls) == 2:
+            from openai import APIStatusError
+            response = httpx.Response(413, request=httpx.Request('POST', 'http://model.invalid'))
+            raise APIStatusError('too large', response=response, body=None)
+        return [{'document_id': d['document_id'], 'questions': []} for d in docs]
+    monkeypatch.setattr(parse_questions, '_parse_batch', parse)
+    response = client.post('/api/documents/prepare-batch', json={'document_ids': ids})
+    assert response.status_code == 413 and len(calls) == 2
+    assert len(response.json()['documents']) == 3
+    assert sum(d['has_drafts'] for d in client.get('/api/documents').json()) == 3

@@ -3,6 +3,7 @@ from hashlib import sha256
 from pathlib import PureWindowsPath
 
 from fastapi import FastAPI, HTTPException, UploadFile, Query, Response
+from fastapi.encoders import jsonable_encoder
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy.exc import SQLAlchemyError
@@ -19,7 +20,7 @@ from .service import Library
 def create_app(settings=None):
     settings = settings or Settings()
     engine = make_engine(settings)
-    library = Library(sessionmaker(engine, expire_on_commit=False), settings.originals_dir, settings.parse_batch_size)
+    library = Library(sessionmaker(engine, expire_on_commit=False), settings.originals_dir)
 
     @asynccontextmanager
     async def lifespan(app):
@@ -80,7 +81,9 @@ def create_app(settings=None):
 
     @app.post('/api/documents/prepare-batch')
     def prepare_batch(body: DocumentSelection):
-        return library.prepare_batch(body.document_ids)
+        result = library.prepare_batch(body.document_ids)
+        code = result.pop('status_code')
+        return JSONResponse(jsonable_encoder(result), status_code=code)
 
     @app.post('/api/documents/{key}/prepare')
     def prepare(key: str):

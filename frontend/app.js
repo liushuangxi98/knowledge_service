@@ -1,6 +1,6 @@
 const $ = selector => document.querySelector(selector);
 const esc = value => String(value ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;'}[c]));
-let documents = [], questions = [], edit = null, batch = [], parsing = false;
+let documents = [], questions = [], edit = null, batch = [], parsing = false, batchError = '';
 
 // 只在展示答案时解析 Markdown。原始 HTML 会按文字转义，编辑和提交继续使用原文。
 const markdown = window.markdownit({html: false, breaks: true});
@@ -24,7 +24,7 @@ async function api(path, method = 'GET', body) {
   if (!response.ok) {
     const detail = result.detail;
     const error = new Error(Array.isArray(detail) ? '请核对题目、来源位置和输入长度。' : detail || result.error?.message || '请求失败');
-    error.status = response.status;
+    error.status = response.status; error.result = result;
     throw error;
   }
   return result;
@@ -82,8 +82,9 @@ function confirmButton() {
   return pending.length ? button(`确认本批入库（${pending.length} 份）`, 'confirm') : '';
 }
 function batchNavigation() {
-  return batch.length > 1 ? `<nav class="batch-documents" aria-label="切换文档">${batch.map((doc, i) =>
-    `<button type="button" class="light" data-action="batch-open" data-id="${i}" aria-current="${doc === edit}">${esc(doc.filename)}${doc.status === 'confirmed' ? ' ✓' : ''}</button>`).join('')}</nav>` : '';
+  const notice = batchError ? `<p class="draft-note error">${esc(batchError)}；已成功的文档可继续确认入库。</p>` : '';
+  return notice + (batch.length > 1 ? `<nav class="batch-documents" aria-label="切换文档">${batch.map((doc, i) =>
+    `<button type="button" class="light" data-action="batch-open" data-id="${i}" aria-current="${doc === edit}">${esc(doc.filename)}${doc.status === 'confirmed' ? ' ✓' : ''}</button>`).join('')}</nav>` : '');
 }
 function openBatchDocument(index) {
   const form = $('#draft-form');
@@ -99,13 +100,23 @@ async function prepareDocuments(ids) {
   if (parsing) throw new Error('正在整理文档，请等待完成。');
   parsing = true; $('#upload').disabled = true; syncSelection('documents');
   const request = {};
+  batchError = '';
   edit = request;
   dialog('<h2>整理草稿</h2><p>正在按批整理所选文档…</p>');
   try {
-    const result = await api('/documents/prepare-batch', 'POST', {document_ids: ids});
+    let result;
+    try {
+      result = await api('/documents/prepare-batch', 'POST', {document_ids: ids});
+    } catch (error) {
+      if (error.status !== 413 || !error.result?.documents?.length) throw error;
+      result = error.result;
+    }
     if (edit !== request || !$('#editor').open) return;
+    batchError = result.error || '';
     batch = result.documents.map(doc => ({...doc, filename: documents.find(d => d.id === doc.document_id).filename, id: doc.document_id}));
+    if (!batch.length) throw new Error(result.error || '没有可展示的文档结果');
     openBatchDocument(0);
+    if (result.error) status(result.error + '；已成功的文档可继续确认入库。', true);
   } catch (error) {
     await refresh();
     if (edit === request && $('#editor').open) dialog('<h2>整理文档失败</h2>');
@@ -281,7 +292,7 @@ document.addEventListener('click',async event=>{
       const result = await api('/documents/confirm-batch', 'POST', {documents: groups});
       $('#editor').close();
       await refresh();
-      status(`本批已确认 ${groups.length} 份文档，共 ${result.question_ids.length} 道题。`);
+      status(`本批已确认 ${groups.length} 份文档，共 ${result.question_ids.length} 道题。${batchError}`, !!batchError);
     }
     if(action==='edit'){
       edit=questions.find(q=>q.question_id===id);

@@ -17,12 +17,13 @@ def library(tmp_path, monkeypatch):
     # 默认关闭测试进程的模型配置，避免误用开发者本机密钥。
     for name in ('LLM_API_KEY', 'EMBEDDING_API_KEY'):
         monkeypatch.setenv(name, '')
-    from knowledge_agent import rag
+    from knowledge_agent import parse_questions, rag
+    monkeypatch.setattr(parse_questions.settings, "parse_batch_size", 3)
     monkeypatch.setattr(rag, 'del_index', lambda questions: None)
     if not os.environ.get('KNOWLEDGE_TEST_MYSQL_PORT'):
         pytest.skip('请指定隔离实例的 KNOWLEDGE_TEST_MYSQL_PORT 和 KNOWLEDGE_TEST_MYSQL_PASSWORD')
     database = 'knowledge_test_' + uuid4().hex
-    settings = Settings(_env_file=None, parse_batch_size=3, mysql_host='127.0.0.1', mysql_user='root', mysql_database=database,
+    settings = Settings(_env_file=None, mysql_host='127.0.0.1', mysql_user='root', mysql_database=database,
                         mysql_port=int(os.environ['KNOWLEDGE_TEST_MYSQL_PORT']),
                         mysql_password=os.environ['KNOWLEDGE_TEST_MYSQL_PASSWORD'], originals_dir=tmp_path)
     initialize(settings)
@@ -142,7 +143,7 @@ def test_prepare_reuses_confirmed_questions_after_restart(library, monkeypatch):
     url = f'/api/documents/{key}'
     drafts = [{'question': f'题目 {i}'} for i in range(5)]
     parser = Mock(return_value=[{'document_id': key, 'questions': drafts}])
-    monkeypatch.setattr(parse_questions, 'parse_questions', parser, raising=False)
+    monkeypatch.setattr(parse_questions, '_parse_batch', parser, raising=False)
     prepared = client.post(url + '/prepare').json()
     assert prepared['status'] == 'draft' and len(prepared['questions']) == 5
     parser.assert_called_once_with([{'document_id': key, 'filename': '面试.md', 'source': '# 面试'}])
@@ -316,8 +317,8 @@ def test_agent_parse_index_and_search(monkeypatch, memory_chroma):
         return httpx.Response(200, json={'data': data})
     mock_model_http(monkeypatch, respond)
     parsed = parse_questions.parse_questions([{'document_id': 'doc', 'filename': '题库.md', 'source': '# 题库'}])
-    assert parsed == [{'document_id': 'doc', 'questions': drafts}]
-    rag.rebuild_index([dict(item, question_id=f'q{i}') for i, item in enumerate(parsed[0]['questions'])])
+    assert parsed['documents'] == [{'document_id': 'doc', 'questions': drafts}]
+    rag.rebuild_index([dict(item, question_id=f'q{i}') for i, item in enumerate(parsed['documents'][0]['questions'])])
     assert memory_chroma.count() == 2
     assert rag.search_ids('排序', 1) == ['q0']
 
