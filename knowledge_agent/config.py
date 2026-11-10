@@ -19,6 +19,8 @@ class Settings(BaseSettings):
         env_file=ROOT / '.env', env_file_encoding='utf-8', extra='ignore', str_strip_whitespace=True
     )
     llm_model: str = Field(title='语言模型', default='')
+    llm_max_tokens: int = Field(title='模型最大输出 token 数')
+    parse_batch_size: int = Field(gt=0, description='每批整理的文件数量')
     llm_api_key: SecretStr = Field(title='语言模型密钥', default=SecretStr(''))
     llm_base_url: str = Field(title='模型服务地址', default='')
 
