@@ -1,6 +1,6 @@
 const $ = selector => document.querySelector(selector);
 const esc = value => String(value ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;'}[c]));
-let documents = [], questions = [], edit = null;
+let documents = [], questions = [], edit = null, batch = [], parsing = false;
 
 // 只在展示答案时解析 Markdown。原始 HTML 会按文字转义，编辑和提交继续使用原文。
 const markdown = window.markdownit({html: false, breaks: true});
@@ -52,16 +52,67 @@ function readFields(node) {
 }
 async function refresh() {
   [documents, questions] = await Promise.all([api('/documents'),api('/questions?q='+encodeURIComponent($('#filter').elements.q.value))]);
-  $('#docs-list').innerHTML = documents.map(d => `<article class="row"><div><h3>${esc(d.filename)}</h3><small>${d.questions_llm_confirmed ? '题目已确认' : '原件已保存'}</small></div>
+  $('#docs-list').innerHTML = documents.map(d => `<article class="row"><div><h3><label><input type="checkbox" data-select="documents" data-id="${esc(d.id)}" aria-label="选择文档 ${esc(d.filename)}"> ${esc(d.filename)}</label></h3><small>${d.questions_llm_confirmed ? '题目已确认' : d.has_drafts ? '已整理待确认' : '原件已保存'}</small></div>
     <div class="actions"><a target="_blank" rel="noopener" href="/api/documents/${encodeURIComponent(d.id)}/content">查看原文</a>
     ${button('整理草稿','draft',d.id)}${button('删除文档','remove-doc',d.id)}</div></article>`).join('') || '<p>暂无文档。</p>';
   $('#question-list').innerHTML = questions.map(q => {
     const doc = documents.find(d=>d.id===q.document_id);
-    return `<article class="row"><div><h3>${esc(q.sort_order)}. ${esc(q.question)}</h3><small>${esc(q.tags.join(' · '))} ${q.index_status==='indexed'?'已索引':'待建索引'}</small>
+    return `<article class="row"><div><h3><label><input type="checkbox" data-select="questions" data-id="${esc(q.question_id)}" aria-label="选择题目 ${esc(q.question)}"> ${esc(q.sort_order)}. ${esc(q.question)}</label></h3><small>${esc(q.tags.join(' · '))} ${q.index_status==='indexed'?'已索引':'待建索引'}</small>
       <details><summary>答案与来源</summary>${answerHTML(q.answer, '暂无参考答案')}
       ${doc?`<a target="_blank" rel="noopener" href="/api/documents/${encodeURIComponent(doc.id)}/content">${esc(doc.filename)}</a>`:'手动录入'} ${esc(q.locator)}</details></div>
       <div class="actions">${button('编辑','edit',q.question_id)}${button('删除题目','remove-question',q.question_id)}</div></article>`;
   }).join('') || '<p>没有符合条件的已确认题目。</p>';
+  syncSelection('documents'); syncSelection('questions');
+}
+function selected(kind) {
+  return [...document.querySelectorAll(`[data-select="${kind}"]:checked`)].map(node => node.dataset.id);
+}
+function syncSelection(kind) {
+  const nodes = [...document.querySelectorAll(`[data-select="${kind}"]`)];
+  const count = selected(kind).length;
+  const all = document.querySelector(`[data-all="${kind}"]`);
+  all.disabled = !nodes.length;
+  all.checked = !!nodes.length && count === nodes.length;
+  all.indeterminate = count > 0 && count < nodes.length;
+  $('#' + kind + '-count').textContent = `已选 ${count} ${kind === 'documents' ? '份' : '道'}`;
+  $(kind === 'documents' ? '#prepare-selected' : '#delete-selected').disabled = !count || (kind === 'documents' && parsing);
+}
+function confirmButton() {
+  const pending = batch.filter(doc => doc.status === 'draft');
+  return pending.length ? button(`确认本批入库（${pending.length} 份）`, 'confirm') : '';
+}
+function batchNavigation() {
+  return batch.length > 1 ? `<nav class="batch-documents" aria-label="切换文档">${batch.map((doc, i) =>
+    `<button type="button" class="light" data-action="batch-open" data-id="${i}" aria-current="${doc === edit}">${esc(doc.filename)}${doc.status === 'confirmed' ? ' ✓' : ''}</button>`).join('')}</nav>` : '';
+}
+function openBatchDocument(index) {
+  const form = $('#draft-form');
+  if (form) edit.drafts = [...form.querySelectorAll('fieldset')].map(readFields);
+  edit = batch[index];
+  if (edit.status === 'confirmed') {
+    dialog(`<h2>已确认题目</h2><p>${esc(edit.filename)} · ${edit.questions.length} 道</p>` + batchNavigation() + questionPreview(edit.questions) + confirmButton());
+  } else {
+    draftForm(edit.drafts ?? edit.questions, edit.questions.length ? '' : '未提取到题目，可添加题目或确认空结果。');
+  }
+}
+async function prepareDocuments(ids) {
+  if (parsing) throw new Error('正在整理文档，请等待完成。');
+  parsing = true; $('#upload').disabled = true; syncSelection('documents');
+  const request = {};
+  edit = request;
+  dialog('<h2>整理草稿</h2><p>正在按批整理所选文档…</p>');
+  try {
+    const result = await api('/documents/prepare-batch', 'POST', {document_ids: ids});
+    if (edit !== request || !$('#editor').open) return;
+    batch = result.documents.map(doc => ({...doc, filename: documents.find(d => d.id === doc.document_id).filename, id: doc.document_id}));
+    openBatchDocument(0);
+  } catch (error) {
+    await refresh();
+    if (edit === request && $('#editor').open) dialog('<h2>整理文档失败</h2>');
+    throw error;
+  } finally {
+    parsing = false; $('#upload').disabled = false; syncSelection('documents');
+  }
 }
 function questionSummary(title, number) {
   return `<summary><span class="draft-number">${number}</span><span class="draft-title">${esc(title || '未填写题干')}</span></summary>`;
@@ -79,20 +130,21 @@ function editableDraft(q, number) {
 function draftForm(items, note = '') {
   dialog(`<div class="draft-workspace"><header class="draft-head"><h2>整理题目草稿</h2>
     <p>${esc(edit.filename)}</p></header>${note ? `<p class="draft-note">${esc(note)}</p>` : ''}
-    <form id="draft-form"><div class="draft-tools"><strong id="draft-count">共 ${items.length} 道</strong>
+    ${batchNavigation()}<form id="draft-form"><div class="draft-tools"><strong id="draft-count">共 ${items.length} 道</strong>
       <label>排序 <select id="draft-sort"><option value="">当前顺序</option><option value="locator">按原文位置</option><option value="question">按题干</option></select></label></div>
     <div id="drafts" class="draft-list">${items.map((item,i)=>editableDraft(item,i+1)).join('')}</div>
-    <footer class="draft-footer">${button('再加一道','more')}<button>预览草稿</button></footer></form></div>`);
+    <footer class="draft-footer">${button('再加一道','more')}<button>预览草稿</button>${confirmButton()}</footer></form></div>`);
 }
 function previewDrafts() {
   const items = edit.drafts;
   dialog(`<div class="draft-workspace"><header class="draft-head"><h2>核对题目草稿</h2>
     <p>${esc(edit.filename)} · 共 ${items.length} 道</p></header>
-    <div class="review-layout"><nav id="review-list" aria-label="选择预览题目">${items.map((q,i) =>
+    ${batchNavigation()}<div class="review-layout"><nav id="review-list" aria-label="选择预览题目">${items.map((q,i) =>
       `<button type="button" data-action="review-one" data-id="${i}"><span class="draft-number">${i+1}</span><span>${esc(q.question)}</span></button>`).join('')}
     </nav><article id="review-reading" aria-live="polite"></article></div>
-    <footer class="draft-footer">${button('返回编辑','back')}<button type="button" data-action="confirm" data-id="${esc(edit.id)}">确认入库</button></footer></div>`);
-  showDraft(0);
+    <footer class="draft-footer">${button('返回编辑','back')}${confirmButton()}</footer></div>`);
+  if (items.length) showDraft(0);
+  else $('#review-reading').textContent = '该文档没有题目，确认后保留原件。';
 }
 function showDraft(index) {
   const q = edit.drafts[index];
@@ -117,6 +169,11 @@ document.addEventListener('input', event => {
   if (row) $('#draft-sort').value = '';
 });
 document.addEventListener('change', event => {
+  const kind = event.target.dataset.all || event.target.dataset.select;
+  if (kind) {
+    if (event.target.dataset.all) document.querySelectorAll(`[data-select="${kind}"]`).forEach(node => {node.checked = event.target.checked;});
+    syncSelection(kind); return;
+  }
   if (event.target.id !== 'draft-sort' || !event.target.value) return;
   const list = $('#drafts');
   const key = event.target.value;
@@ -135,14 +192,37 @@ document.addEventListener('invalid', event => {
 }, true);
 $('#upload').onclick = () => $('#file').click();
 $('#file').onchange = async event => {
-  const file = event.target.files[0]; if (!file) return;
-  event.target.value=''; $('#upload').disabled=true;
+  const files = [...event.target.files]; if (!files.length) return;
+  event.target.value = ''; $('#upload').disabled = true;
+  let uploaded = 0;
   try {
-    if (file.size>16*1024*1024) throw new Error('单份 Markdown 原件不能超过 16 MiB');
-    const body=new FormData(); body.append('file',file);
-    const doc=await api('/documents','POST',body); await refresh();
-    status(doc.reused ? '已复用相同原件。' : '原件已保存。');
-  } catch(e){status(e.message,true)} finally{$('#upload').disabled=false}
+    if (files.some(file => !file.name.toLowerCase().endsWith('.md'))) throw new Error('请选择 Markdown（.md）文件');
+    if (files.some(file => file.size > 16 * 1024 * 1024)) throw new Error('单份 Markdown 原件不能超过 16 MiB');
+    const ids = [];
+    for (const file of files) {
+      status(`正在上传 ${uploaded + 1} / ${files.length}：${file.name}`);
+      const body = new FormData(); body.append('file', file);
+      const doc = await api('/documents', 'POST', body);
+      ids.push(doc.id); uploaded++;
+    }
+    await refresh();
+    const uniqueIds = [...new Set(ids)];
+    status(`已处理 ${uploaded} 个文件，原件列表中对应 ${uniqueIds.length} 份文档。请勾选需要整理的文档。${uniqueIds.length < uploaded ? '内容相同的文件已合并。' : ''}`);
+  } catch (error) {
+    await refresh();
+    status(`${error.message}；本轮已停止，已上传 ${uploaded} 份原件保留。`, true);
+  } finally { $('#upload').disabled = false; }
+};
+$('#prepare-selected').onclick = () => prepareDocuments(selected('documents')).catch(error => status(error.message, true));
+$('#delete-selected').onclick = async event => {
+  const ids = selected('questions');
+  if (!ids.length || !confirm(`删除所选 ${ids.length} 道题及对应向量？原文档保留。`)) return;
+  const button = event.currentTarget; button.disabled = true;
+  try {
+    const result = await api('/questions/batch-delete', 'POST', {question_ids: ids});
+    await refresh(); status(`已删除 ${result.deleted} 道题目。`);
+  } catch (error) { status(error.message, true); }
+  finally { syncSelection('questions'); }
 };
 $('#rebuild').onclick = async event => {
   const button = event.currentTarget;
@@ -166,24 +246,8 @@ document.addEventListener('click',async event=>{
   const b=event.target.closest('[data-action]'); if(!b || b.disabled)return;
   const {action,id}=b.dataset; b.disabled=true;
   try {
-    if (action === 'draft') {
-      const doc = documents.find(d => d.id === id);
-      edit = doc;
-      dialog('<h2>整理草稿</h2><p>正在读取文档题目…</p>');
-      try {
-        const result = await api('/documents/' + encodeURIComponent(id) + '/prepare', 'POST');
-        if (edit !== doc || !$('#editor').open) return;
-        if (result.status === 'confirmed') {
-          dialog(`<h2>已确认题目</h2><p>${esc(doc.filename)} · ${result.questions.length} 道</p>` +
-            questionPreview(result.questions));
-        } else {
-          draftForm(result.questions.length ? result.questions : [{}]);
-        }
-      } catch (error) {
-        if (edit !== doc || !$('#editor').open) return;
-        throw error;
-      }
-    }
+    if (action === 'draft') await prepareDocuments([id]);
+    if (action === 'batch-open') openBatchDocument(Number(id));
     if (action === 'more') {
       const list = $('#drafts');
       list.insertAdjacentHTML('beforeend', editableDraft({}, list.children.length + 1));
@@ -205,8 +269,19 @@ document.addEventListener('click',async event=>{
     if (action === 'review-one') showDraft(Number(id));
     if(action==='back')draftForm(edit.drafts);
     if(action==='confirm'){
-      const result=await api('/documents/'+id+'/confirm','POST',{questions:edit.drafts});
-      $('#editor').close(); await refresh(); status('已确认 '+result.question_ids.length+' 道题，题目可在下方查看。');
+      const form = $('#draft-form');
+      if (form) edit.drafts = [...form.querySelectorAll('fieldset')].map(readFields);
+      const pending = batch.filter(doc => doc.status === 'draft');
+      const groups = pending.map(doc => ({document_id: doc.id, questions: doc.drafts ?? doc.questions}));
+      const invalid = groups.findIndex(group => group.questions.some(q => !q.question.trim()));
+      if (invalid >= 0) {
+        openBatchDocument(batch.indexOf(pending[invalid]));
+        throw new Error('请补全本文件的题干后再确认入库。');
+      }
+      const result = await api('/documents/confirm-batch', 'POST', {documents: groups});
+      $('#editor').close();
+      await refresh();
+      status(`本批已确认 ${groups.length} 份文档，共 ${result.question_ids.length} 道题。`);
     }
     if(action==='edit'){
       edit=questions.find(q=>q.question_id===id);

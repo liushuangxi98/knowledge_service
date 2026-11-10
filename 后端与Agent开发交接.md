@@ -7,60 +7,32 @@
 | 阶段 | 谁提供输入 | 执行逻辑 | 结果交给谁 |
 | --- | --- | --- | --- |
 | 上传 Markdown | 浏览器上传文件 | 已实现，上传阶段没有模型调用 | 原件在磁盘，文档 ID 在 MySQL |
-| 整理草稿 | 后端传入已解码的原文 | `parse_questions(source)` | 返回题目列表，前端预览、编辑 |
+| 整理草稿 | 后端传入文档 ID、文件名和原文的列表 | `parse_questions(documents)` | 返回按文档分组的草稿，前端切换预览、编辑 |
 | 确认入库 | 前端提交用户改好的整批草稿 | 已实现，由后端执行一个 MySQL 事务 | 返回正式 `question_ids`，新题为 `pending` |
 | 建立索引 | 用户点「全量重建向量索引」，后端传入全部正式题目 | 调用百炼、按题目 ID 写 Chroma | 成功的题目标为 `indexed` |
 | 考点检索 | 调用方传入考点和返回数量 | 对考点做向量化，召回 ID，从 MySQL 取回题目和出处 | 知识库通过 HTTP 返回给面试 Agent |
 
 主流程：**上传 → 整理草稿 → 人工确认并入库；手动点击全量重建 → 向量入库**。相关按钮与后端的实际交接见[前端操作](frontend/app.js)、[HTTP 路由](backend/app.py)和[业务服务](backend/service.py)。
 
-## 1. 拆题：已经接好调用入口
+## 1. 拆题：批量输入与分组输出
 
-在 [knowledge_agent/parse_questions.py](knowledge_agent/parse_questions.py) 中实现这个签名：
+同步入口为 `parse_questions(documents: list[dict]) -> list[dict]`，单文件也使用一个元素的列表。
 
-```python
-def parse_questions(source: str) -> list[dict]:
-    ...
-```
+输入的每项含 `document_id`、`filename`、`source`。Agent 一次模型调用处理整批原文，使用 `BatchQuestionDrafts` 包装 `QuestionDrafts` 列表；`QuestionDrafts` 含原样返回的 `document_id` 和 `questions: list[QuestionInput]`。每份文档独立提取题干、原文答案、标签和 locator，没有题目允许空列表，不跨文档合并。模型解析失败向上抛错，不返回空列表冒充成功。
 
-点击「整理草稿」会发送 `POST /api/documents/{id}/prepare`。后端的 `Library.prepare()` 先查看该文档的 `questions_llm_confirmed`：
+后端 `POST /api/documents/prepare-batch` 接收 `document_ids`，重复 ID 去重。已确认文档直接读 MySQL；已整理草稿直接复用，首次整理的原文按每批按 .env 的 PARSE_BATCH_SIZE（当前为 20）交给 Agent，每批草稿独立提交，失败即停止。后端检查输出分组不存在缺失、重复或未知 ID，按输入顺序返回 `documents`，各项含 `document_id`、`status` 和 `questions`。单文档 prepare 复用同一业务方法。合并原文按序列化字节检查，超限在模型调用前停止，413 不自动重试。
 
-- **True**：直接从 MySQL 取这份文档现存的正式题目，返回 `status="confirmed"`。哪怕五道题全部是 `pending`，拆题函数也不会被调用。用户后来删光了题目，会得到空的已确认列表。
-- **False**：后端读取原件，以 UTF-8 解码（兼容 BOM），执行 `parse_questions(source)`。它会逐条用 `QuestionInput` 校验返回值，再以 `status="draft"` 交给前端。Agent 直接使用 SDK 响应，调用失败时向上抛出原始异常。
-
-**函数内部只需要处理原文。** 从 `source` 找出题目边界，提取题干、原文答案和原文位置，补上知识点标签。使用 LLM 时，可以把这些要求写进提示词，用一个含 `questions: list[QuestionInput]` 的结构化结果接收输出，最后返回其中的题目列表。后端当前直接同步调用这个函数，因此这里使用普通 `def`。如模型调用失败，要让调用方看到错误；空列表只用于确实没有提取到题目的情况。
-
-例如，原文是：
-
-```markdown
-## 第二章 检索
-3. 什么是重排？
-答：对已召回的候选结果重新排序。
-4. 怎样评估召回效果？
-```
-
-函数应返回下面这样的 Python 列表。外层 HTTP 响应、文档关联、正式题目 ID 都由后端负责。
-
-```python
-[
-    {"question": "什么是重排？", "answer": "对已召回的候选结果重新排序。",
-     "tags": ["重排"], "locator": "第二章 检索 / 第3题"},
-    {"question": "怎样评估召回效果？", "answer": "",
-     "tags": ["召回评测"], "locator": "第二章 检索 / 第4题"},
-]
-```
-
-`locator` 应能让人回到原文找到该题，例如章节、原题号或段落位置。原文没写答案就保留空字符串。题干必填；额外返回 `question_id`、`document_id`、`index_status` 等字段会被当前草稿模型拒绝。字段长度和默认值以 [QuestionInput](backend/schemas.py) 为准。
+前端按文件切换编辑和预览，通过 /api/documents/confirm-batch 一次确认本批全部待入库文档。单文档接口使用 `/api/documents/{id}/confirm`，请求体需要 `document_id` 与路径一致，以及 `questions` 列表。空结果也可确认。题目字段约束以 `backend/schemas.py` 为准。
 
 ## 2. 确认：后端交给索引器的是什么
 
-用户可以在预览中修改题干或标签，再点「确认入库」。后端执行 `Library.confirm(document_id, drafts)`，锁住该文档，把题目和文档确认标记放在同一个事务中保存。重复确认已经确认过的文档，只返回已有题目 ID。接口返回示意：
+用户可以在预览中修改题干或标签，再点「确认入库」。后端执行 `Library.confirm_batch(groups)`，按稳定顺序锁住所选文档，把题目和文档确认标记放在同一个事务中保存。重复确认已经确认过的文档，只返回已有题目 ID。接口返回示意：
 
 ```json
 {"question_ids": ["q_101", "q_102"]}
 ```
 
-这里和下文的 ID 为示意值。确认接口按最终草稿顺序分配文档内题号 sort_order，重复题只保留首次出现的位置；返回的 ID 也按保存的题号排列。索引器应该按 ID 读取正式记录，以用户最后确认或编辑过的文字为准。[入库实现](backend/service.py) · [两张表的定义](backend/database.py)
+这里和下文的 ID 为示意值。确认接口按最终草稿顺序分配全库递增题号 sort_order，重复题只保留首次出现的位置；返回的 ID 也按保存的题号排列。索引器应该按 ID 读取正式记录，以用户最后确认或编辑过的文字为准。[入库实现](backend/service.py) · [两张表的定义](backend/database.py)
 
 | 存储字段 | 什么时候写 | 回答的问题 |
 | --- | --- | --- |
@@ -89,4 +61,8 @@ def parse_questions(source: str) -> list[dict]:
 2. **再测向量。** 用模型替身检查 5 个正式 ID 与 5 个输入文本、5 个向量一一对应，再用真实服务验证一份小样本。模拟百炼或 Chroma 暂时失败，题目应仍可在页面查看；恢复后手动全量重建，用相同 ID 写入，向量记录数仍为 5。
 3. **最后测检索和变更。** 用原文没有出现的同义问法查询，能找回预期题目并根据 locator 打开原文。只改答案后应读到新答案；改题干后应重建；删题或删文档后检索应排除失效记录，删除请求同时清理对应向量。
 
-现有 [tests/test_library.py](tests/test_library.py) 已覆盖“已确认跳过解析器”、失败回滚、旧库标记回填及重复确认。数据库回归使用隔离实例，真实模型、真实向量和检索效果要分别验证。启动命令和测试环境变量见[项目使用说明](项目使用说明.md)。
+现有 [tests/test_library.py](tests/test_library.py) 已覆盖“已确认跳过解析器”、失败回滚及重复确认。数据库回归使用隔离实例，真实模型、真实向量和检索效果要分别验证。启动命令和测试环境变量见[项目使用说明](项目使用说明.md)。
+
+## 批量题目删除
+
+`POST /api/questions/batch-delete` 接收非空 `question_ids`，复用现有索引锁，在一个 MySQL 事务中检查所选题目、批量删除，并一次调用 `rag.del_index`。重复 ID 去重；含已不存在的题目时返回 404，提示刷新，不删除剩余项。向量删除失败回滚 MySQL。成功返回 `deleted` 数量，保留 Markdown 原件与文档确认标记。前端全选范围是当前筛选结果，刷新后清空选择。

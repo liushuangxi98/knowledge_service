@@ -1,21 +1,27 @@
 """文档原件、已确认题目和索引状态的存储。拆题和检索由 knowledge_agent 接入。"""
+import json
 from hashlib import sha256
 from pathlib import Path
 from threading import Lock
 from uuid import uuid4
 
 from fastapi import HTTPException
-from sqlalchemy import select
+from pydantic import ValidationError
+from sqlalchemy import delete, select
 from sqlalchemy.dialects.mysql import insert
 
 from knowledge_agent import parse_questions, rag
-from .database import Document, Question
-from .schemas import QuestionInput
+from .database import Document, DocumentDraft, Question, QuestionCounter
+from .schemas import QuestionDrafts
 
 
-def show_document(doc):
+# 为模型请求的系统消息、工具结构和协议字段保留 1 MiB；按序列化字节检查，不按 token 估算。
+MAX_PARSE_INPUT_BYTES = 47 * 1024**2
+
+
+def show_document(doc, has_drafts=False):
     return {'id': doc.id, 'filename': doc.filename, 'created_at': doc.created_at,
-            'questions_llm_confirmed': doc.questions_llm_confirmed,
+            'questions_llm_confirmed': doc.questions_llm_confirmed, 'has_drafts': has_drafts,
             'parse_status': 'ready'}
 
 
@@ -32,15 +38,17 @@ def get_record(session, model, key, *, lock=False):
 
 
 class Library:
-    def __init__(self, sessions, originals):
+    def __init__(self, sessions, originals, parse_batch_size):
         self.sessions = sessions
         self.originals = Path(originals)
         self.index_lock = Lock()
+        self.parse_batch_size = parse_batch_size
 
     def documents(self):
         with self.sessions() as session:
-            rows = session.scalars(select(Document).order_by(Document.created_at.desc(), Document.id))
-            return [show_document(doc) for doc in rows]
+            rows = session.execute(select(Document, DocumentDraft.document_id).outerjoin(DocumentDraft)
+                                   .order_by(Document.created_at.desc(), Document.id))
+            return [show_document(doc, draft_id is not None) for doc, draft_id in rows]
 
     def upload(self, filename, content):
         digest = sha256(content).hexdigest()
@@ -58,7 +66,8 @@ class Library:
                     with path.open('xb') as stream:
                         new_file = path
                         stream.write(content)
-                return {**show_document(doc), 'reused': doc.id != new_id}
+                has_drafts = session.scalar(select(DocumentDraft.document_id).where(DocumentDraft.document_id == doc.id))
+                return {**show_document(doc, has_drafts is not None), 'reused': doc.id != new_id}
         except Exception:
             if new_file:
                 new_file.unlink(missing_ok=True)
@@ -67,10 +76,13 @@ class Library:
     def original(self, key):
         with self.sessions.begin() as session:
             doc = get_record(session, Document, key, lock=True)
-            path = self.originals / (doc.id + '.md')
-            if not path.is_file():
-                raise HTTPException(404, '原件文件不存在')
-            return path.read_bytes()
+            return self._read_original(doc.id)
+
+    def _read_original(self, key):
+        path = self.originals / (key + '.md')
+        if not path.is_file():
+            raise HTTPException(404, '原件文件不存在')
+        return path.read_bytes()
 
     @staticmethod
     def delete_vectors(question_ids):
@@ -111,9 +123,7 @@ class Library:
                 backup.unlink()
 
     def questions(self, query, document_id):
-        # 全库列表按来源文档归组；手动题单独一组，每组均按已保存的题号显示。
-        stmt = select(Question).outerjoin(Document).order_by(
-            Document.created_at.desc(), Document.filename, Document.sha256, Question.sort_order)
+        stmt = select(Question).order_by(Question.sort_order)
         if document_id:
             stmt = stmt.where(Question.document_id == document_id)
         if query:
@@ -122,45 +132,120 @@ class Library:
             return [show_question(item) for item in session.scalars(stmt)]
 
     def prepare(self, key):
-        """已确认的文档直接读正式题目；只有未确认的文档才需要拆题。"""
-        with self.sessions() as session:
-            doc = get_record(session, Document, key)
-            if doc.questions_llm_confirmed:
-                rows = session.scalars(select(Question).where(Question.document_id == key).order_by(Question.sort_order))
-                return {'status': 'confirmed', 'questions': [show_question(row) for row in rows]}
+        return self.prepare_batch([key])['documents'][0]
 
-        source = self.original(key).decode('utf-8-sig')
-        drafts = parse_questions.parse_questions(source)
-        return {'status': 'draft', 'questions': [QuestionInput.model_validate(item).model_dump() for item in drafts]}
+    def prepare_batch(self, keys):
+        """按配置分批，成功后单独提交草稿，失败即停止。"""
+        keys = list(dict.fromkeys(keys))
+        results = []
+        size = self.parse_batch_size
+        for start in range(0, len(keys), size):
+            try:
+                group = self._prepare_group(keys[start:start + size])
+            except HTTPException as exc:
+                message = f'第 {start // size + 1} 批整理失败：{exc.detail}'
+                if results:
+                    message += f'；前 {len(results)} 份文档的结果已保存，可继续复用。'
+                raise HTTPException(exc.status_code, message) from exc
+            results.extend(group['documents'])
+        return {'documents': results}
 
-    def confirm(self, key, drafts):
+    def _prepare_group(self, keys):
+        """已确认文档和已有草稿直接复用，其余原文交给 Agent。"""
+        keys = list(dict.fromkeys(keys))
+        results, sources = {}, []
         with self.sessions.begin() as session:
-            doc = get_record(session, Document, key, lock=True)
-            if doc.questions_llm_confirmed:
-                # 另一标签页可能已提交了同一文档，旧草稿不会再写入。
-                ids = session.scalars(select(Question.question_id).where(Question.document_id == key)
-                                      .order_by(Question.sort_order)).all()
-                return {'question_ids': ids}
-            ids = {}
-            for draft in drafts:
-                # 来源文档、原文位置和题干决定是否为同一题。重复确认保留人工编辑和索引状态。
-                source_key = sha256((draft.locator + '\0' + draft.question).encode()).hexdigest()
-                if source_key in ids:
+            docs = self._lock_documents(session, keys)
+            for key in keys:
+                doc = docs[key]
+                if doc.questions_llm_confirmed:
+                    rows = session.scalars(select(Question).where(Question.document_id == key)
+                                           .order_by(Question.sort_order))
+                    results[key] = {'document_id': key, 'status': 'confirmed',
+                                    'questions': [show_question(row) for row in rows]}
+                elif (draft := session.get(DocumentDraft, key)) is not None:
+                    results[key] = {'document_id': key, 'status': 'draft', 'questions': draft.questions}
+                else:
+                    sources.append({'document_id': key, 'filename': doc.filename,
+                                    'source': self._read_original(key).decode('utf-8-sig')})
+            if sources:
+                payload = json.dumps({'documents': sources}, ensure_ascii=False)
+                if len(json.dumps(payload, ensure_ascii=True).encode('utf-8')) > MAX_PARSE_INPUT_BYTES:
+                    raise HTTPException(413, '合并原文过大，请减少所选文档；本轮已停止，不会自动拆批重试')
+                try:
+                    drafts = [QuestionDrafts.model_validate(item) for item in parse_questions.parse_questions(sources)]
+                except parse_questions.DraftParseError as exc:
+                    raise HTTPException(502, str(exc)) from exc
+                except ValidationError as exc:
+                    raise HTTPException(502, parse_questions.field_error(exc)) from exc
+                names = {s['document_id']: s['filename'] for s in sources}
+                returned = [draft.document_id for draft in drafts]
+                if len(returned) != len(set(returned)) or set(returned) != names.keys():
+                    missing = [name for key, name in names.items() if key not in returned]
+                    issues = []
+                    if missing:
+                        issues.append('缺少 ' + '、'.join(missing))
+                    if len(returned) != len(set(returned)):
+                        issues.append('重复返回文档 ID')
+                    if set(returned) - names.keys():
+                        issues.append('返回了本次未送入模型的文档 ID')
+                    raise HTTPException(502, '模型返回的文档分组有误：' + '；'.join(issues))
+                for draft in drafts:
+                    group = draft.model_dump()
+                    session.add(DocumentDraft(document_id=draft.document_id, questions=group['questions']))
+                    results[draft.document_id] = {**group, 'status': 'draft'}
+        return {'documents': [results[key] for key in keys]}
+
+    @staticmethod
+    def _lock_documents(session, keys):
+        rows = session.scalars(select(Document).where(Document.id.in_(keys)).order_by(Document.id).with_for_update())
+        docs = {row.id: row for row in rows}
+        if docs.keys() != set(keys):
+            raise HTTPException(404, '文档不存在或已删除')
+        return docs
+
+    @staticmethod
+    def _number_counter(session):
+        # 单行写锁与题目处于同一事务，整批提交或回滚。
+        session.execute(insert(QuestionCounter).values(id=1, last_number=0).on_duplicate_key_update(id=1))
+        return session.get(QuestionCounter, 1, with_for_update=True)
+
+    def confirm_batch(self, groups):
+        keys = [group.document_id for group in groups]
+        if not keys or len(set(keys)) != len(keys):
+            raise HTTPException(422, '请提交一份或多份不同文档的草稿')
+        ids = []
+        with self.sessions.begin() as session:
+            docs = self._lock_documents(session, keys)
+            counter = self._number_counter(session)
+            for group in groups:
+                doc = docs[group.document_id]
+                if doc.questions_llm_confirmed:
+                    ids.extend(session.scalars(select(Question.question_id).where(Question.document_id == doc.id)
+                                               .order_by(Question.sort_order)))
                     continue
-                item = Question(**draft.model_dump(), document_id=key, source_key=source_key, sort_order=len(ids) + 1)
-                session.add(item)
-                session.flush()
-                ids[source_key] = item.question_id
-            # 与题目写入一起提交。只生成草稿、或事务失败时均不标记为已确认。
-            doc.questions_llm_confirmed = True
-            return {'question_ids': list(ids.values())}
+                seen = set()
+                for draft in group.questions:
+                    source_key = sha256((draft.locator + '\0' + draft.question).encode()).hexdigest()
+                    if source_key in seen:
+                        continue
+                    seen.add(source_key)
+                    counter.last_number += 1
+                    item = Question(**draft.model_dump(), document_id=doc.id, source_key=source_key,
+                                    sort_order=counter.last_number)
+                    session.add(item)
+                    session.flush()
+                    ids.append(item.question_id)
+                doc.questions_llm_confirmed = True
+                session.execute(delete(DocumentDraft).where(DocumentDraft.document_id == doc.id))
+        return {'question_ids': ids}
 
     def save_question(self, data, key=None):
         with self.sessions.begin() as session:
             if key is None:
-                last = session.scalar(select(Question.sort_order).where(Question.document_id.is_(None))
-                                      .order_by(Question.sort_order.desc()).limit(1).with_for_update())
-                item = Question(**data.model_dump(), sort_order=(last or 0) + 1)
+                counter = self._number_counter(session)
+                counter.last_number += 1
+                item = Question(**data.model_dump(), sort_order=counter.last_number)
                 session.add(item)
             else:
                 item = get_record(session, Question, key, lock=True)
@@ -211,7 +296,17 @@ class Library:
         return {'items': [by_id[key] for key in ids if key in by_id]}
 
     def remove_question(self, key):
+        self.remove_questions([key])
+
+    def remove_questions(self, keys):
         with self.index_lock, self.sessions.begin() as session:
-            session.delete(get_record(session, Question, key, lock=True))
+            keys = set(keys)
+            rows = session.scalars(select(Question).where(Question.question_id.in_(keys))
+                                   .order_by(Question.question_id).with_for_update()).all()
+            if len(rows) != len(keys):
+                raise HTTPException(404, '所选题目已变化，请刷新后重新选择')
+            for row in rows:
+                session.delete(row)
             session.flush()
-            self.delete_vectors([key])
+            self.delete_vectors([row.question_id for row in rows])
+            return {'deleted': len(rows)}

@@ -75,3 +75,9 @@
 .answer-table table { border-collapse:collapse; width:100%; font-size:14px }
 .answer-table th,.answer-table td { min-width:7em; padding:5px 9px; border:1px solid #cdd9d0; vertical-align:top }
 .answer-table th { background:#eef3ed }
+
+.selection-tools { margin:12px 0; font-size:14px }
+.selection-tools label { display:flex; align-items:center; gap:6px }
+.batch-documents { display:flex; flex-wrap:wrap; gap:6px; padding:10px 24px }
+.batch-documents button { margin:0; max-width:100%; overflow-wrap:anywhere; font-size:13px }
+.batch-documents button[aria-current=true] { background:#e5eee4; border-color:#46765b }

@@ -10,7 +10,20 @@ class QuestionInput(BaseModel):
 
 
 class QuestionDrafts(BaseModel):
-    questions: list[QuestionInput] = Field(min_length=1, description='同一份文档的一批题目草稿，每项是一道题，至少包含一道。')
+    document_id: str = Field(min_length=1, description='所属输入文档的 ID，必须原样返回。')
+    questions: list[QuestionInput] = Field(description='该文档的题目草稿，没有题目时返回空列表。')
+
+
+class BatchQuestionDrafts(BaseModel):
+    documents: list[QuestionDrafts] = Field(description='每份输入文档对应一个结果，不遗漏、不合并。')
+
+
+class DocumentSelection(BaseModel):
+    document_ids: list[str] = Field(min_length=1)
+
+
+class QuestionSelection(BaseModel):
+    question_ids: list[str] = Field(min_length=1)
 
 
 class SearchInput(BaseModel):

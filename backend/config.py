@@ -13,6 +13,7 @@ class Settings(BaseSettings):
     mysql_user: str = 'root'
     mysql_password: SecretStr = SecretStr('')
     mysql_database: str = Field(default='knowledge_service', pattern=r'^[A-Za-z][A-Za-z0-9_]{0,63}$')
+    parse_batch_size: int = Field(gt=0, description='每批整理的文件数量')
     originals_dir: Path = ROOT / 'data' / 'originals'
     chroma_url: str = 'http://127.0.0.1:8100'
     chroma_dir: Path = ROOT / 'data' / 'chroma'

@@ -1,6 +1,6 @@
 from datetime import datetime, UTC
 from uuid import uuid4
-from sqlalchemy import CHAR, JSON, Boolean, DateTime, ForeignKey, String, Text, UniqueConstraint, create_engine, inspect, text
+from sqlalchemy import CHAR, JSON, Boolean, DateTime, ForeignKey, String, Text, UniqueConstraint, create_engine, text
 from sqlalchemy.dialects.mysql import MEDIUMTEXT
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
@@ -22,7 +22,7 @@ class Question(Base):
     __tablename__ = 'questions'
     __table_args__ = (UniqueConstraint('document_id', 'source_key'),)
     question_id: Mapped[str] = mapped_column(CHAR(32), primary_key=True, default=lambda: uuid4().hex)
-    # 文档内的题号，按用户确认时的草稿顺序从 1 开始。
+    # 入库事务从全库计数器领取题号。
     sort_order: Mapped[int] = mapped_column(nullable=False)
     document_id: Mapped[str | None] = mapped_column(ForeignKey('documents.id', ondelete='CASCADE'))
     # 保存导入时的指纹，后来人工改题后再次确认同一份草稿仍可复用最终题目 ID。
@@ -32,6 +32,18 @@ class Question(Base):
     tags: Mapped[list] = mapped_column(JSON)
     locator: Mapped[str] = mapped_column(String(500))
     index_status: Mapped[str] = mapped_column(String(16), default='pending')
+
+
+class DocumentDraft(Base):
+    __tablename__ = 'document_drafts'
+    document_id: Mapped[str] = mapped_column(ForeignKey('documents.id', ondelete='CASCADE'), primary_key=True)
+    questions: Mapped[list] = mapped_column(JSON)
+
+
+class QuestionCounter(Base):
+    __tablename__ = 'question_counter'
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=False)
+    last_number: Mapped[int] = mapped_column(nullable=False)
 
 
 def make_engine(settings, *, admin=False):
@@ -49,30 +61,6 @@ def initialize(settings):
     engine = make_engine(settings)
     try:
         Base.metadata.create_all(engine)
-        # create_all 只建缺失的表。旧库建列后用已保存的来源题目补齐标记。
-        with engine.begin() as conn:
-            columns = {col['name']: col for col in inspect(conn).get_columns('documents')}
-            flag = columns.get('questions_llm_confirmed')
-            if flag is None:
-                conn.execute(text('ALTER TABLE documents ADD questions_llm_confirmed BOOLEAN NULL'))
-            if flag is None or flag['nullable']:
-                # NULL 表示尚未迁移。MySQL 的 DDL 会提交，迁移中断后可再次运行。
-                conn.execute(text('UPDATE documents d SET questions_llm_confirmed = EXISTS '
-                                  '(SELECT 1 FROM questions q WHERE q.document_id = d.id) '
-                                  'WHERE questions_llm_confirmed IS NULL'))
-                conn.execute(text('ALTER TABLE documents MODIFY questions_llm_confirmed BOOLEAN NOT NULL DEFAULT 0'))
-
-            columns = {col['name']: col for col in inspect(conn).get_columns('questions')}
-            order = columns.get('sort_order')
-            if order is None:
-                conn.execute(text('ALTER TABLE questions ADD sort_order INT NULL'))
-            if order is None or order['nullable']:
-                # 旧库没有保存草稿顺序，以原有显示顺序为每份文档回填一次题号。
-                conn.execute(text('UPDATE questions q JOIN (SELECT question_id, ROW_NUMBER() OVER '
-                                  '(PARTITION BY document_id ORDER BY question_id) AS n FROM questions) old '
-                                  'ON old.question_id = q.question_id SET q.sort_order = old.n '
-                                  'WHERE q.sort_order IS NULL'))
-                conn.execute(text('ALTER TABLE questions MODIFY sort_order INT NOT NULL'))
     finally:
         engine.dispose()
 

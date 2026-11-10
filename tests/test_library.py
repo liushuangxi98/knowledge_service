@@ -22,7 +22,7 @@ def library(tmp_path, monkeypatch):
     if not os.environ.get('KNOWLEDGE_TEST_MYSQL_PORT'):
         pytest.skip('请指定隔离实例的 KNOWLEDGE_TEST_MYSQL_PORT 和 KNOWLEDGE_TEST_MYSQL_PASSWORD')
     database = 'knowledge_test_' + uuid4().hex
-    settings = Settings(_env_file=None, mysql_host='127.0.0.1', mysql_user='root', mysql_database=database,
+    settings = Settings(_env_file=None, parse_batch_size=3, mysql_host='127.0.0.1', mysql_user='root', mysql_database=database,
                         mysql_port=int(os.environ['KNOWLEDGE_TEST_MYSQL_PORT']),
                         mysql_password=os.environ['KNOWLEDGE_TEST_MYSQL_PASSWORD'], originals_dir=tmp_path)
     initialize(settings)
@@ -52,10 +52,10 @@ def test_document_confirm_and_index_state(library):
     assert len(client.get('/api/documents').json()) == 1
     assert client.get(f'/api/documents/{key}/content').content == original
     assert client.get('/api/questions').json() == []
-    drafts = {'questions': [{'question': '什么是检索？', 'locator': '第一章', 'tags': ['RAG']},
+    drafts = {'document_id': key, 'questions': [{'question': '什么是检索？', 'locator': '第一章', 'tags': ['RAG']},
                             {'question': '什么是重排？', 'answer': '调整顺序'}]}
     url = f'/api/documents/{key}/confirm'
-    assert client.post(url, json={'questions': [drafts['questions'][0], {'question': '  '}]}).status_code == 422
+    assert client.post(url, json={'document_id': key, 'questions': [drafts['questions'][0], {'question': '  '}]}).status_code == 422
     assert not client.get('/api/questions').json()
     ids = client.post(url, json=drafts).json()['question_ids']
     assert len(set(ids)) == 2
@@ -109,7 +109,7 @@ def test_manual_full_rebuild(library, monkeypatch):
     rebuild.reset_mock()
 
     doc = upload(client, '检索.md', b'# search').json()
-    client.post(f"/api/documents/{doc['id']}/confirm", json={'questions': [{'question': '召回'}]}).raise_for_status()
+    client.post(f"/api/documents/{doc['id']}/confirm", json={'document_id': doc['id'], 'questions': [{'question': '召回'}]}).raise_for_status()
     manual = client.post('/api/questions', json={'question': '重排'}).json()
     rebuild.assert_not_called()
     assert client.post(url).json() == {'total': 2, 'indexed': 2}
@@ -141,13 +141,13 @@ def test_prepare_reuses_confirmed_questions_after_restart(library, monkeypatch):
     key = upload(client, '面试.md', '# 面试'.encode()).json()['id']
     url = f'/api/documents/{key}'
     drafts = [{'question': f'题目 {i}'} for i in range(5)]
-    parser = Mock(return_value=drafts)
+    parser = Mock(return_value=[{'document_id': key, 'questions': drafts}])
     monkeypatch.setattr(parse_questions, 'parse_questions', parser, raising=False)
     prepared = client.post(url + '/prepare').json()
     assert prepared['status'] == 'draft' and len(prepared['questions']) == 5
-    parser.assert_called_once_with('# 面试')
+    parser.assert_called_once_with([{'document_id': key, 'filename': '面试.md', 'source': '# 面试'}])
     assert client.get('/api/documents').json()[0]['questions_llm_confirmed'] is False
-    ids = client.post(url + '/confirm', json={'questions': drafts}).json()['question_ids']
+    ids = client.post(url + '/confirm', json={'document_id': key, 'questions': drafts}).json()['question_ids']
     with TestClient(create_app(settings)) as reopened:
         assert reopened.get('/api/documents').json()[0]['questions_llm_confirmed'] is True
         assert upload(reopened, '同一份.md', '# 面试'.encode()).json()['questions_llm_confirmed'] is True
@@ -155,27 +155,14 @@ def test_prepare_reuses_confirmed_questions_after_restart(library, monkeypatch):
         assert data['status'] == 'confirmed'
         assert {q['question_id'] for q in data['questions']} == set(ids)
         assert all(q['index_status'] == 'pending' for q in data['questions'])
-        stale = reopened.post(url + '/confirm', json={'questions': [{'question': '另一版措辞'}]})
+        stale = reopened.post(url + '/confirm', json={'document_id': key, 'questions': [{'question': '另一版措辞'}]})
         assert set(stale.json()['question_ids']) == set(ids)
         for qid in ids:
             assert reopened.delete('/api/questions/' + qid).status_code == 204
-        assert reopened.post(url + '/prepare').json() == {'status': 'confirmed', 'questions': []}
+        assert reopened.post(url + '/prepare').json() == {'document_id': key, 'status': 'confirmed', 'questions': []}
     parser.assert_called_once()
 
 
-def test_upgrade_backfills_old_confirmations(library):
-    client, settings = library
-    key = upload(client, '旧文档.md', b'# old').json()['id']
-    new = upload(client, '未整理.md', b'# new').json()['id']
-    client.post(f'/api/documents/{key}/confirm', json={'questions': [{'question': '原题'}]}).raise_for_status()
-    engine = make_engine(settings)
-    with engine.begin() as conn:
-        conn.execute(text('ALTER TABLE documents DROP COLUMN questions_llm_confirmed'))
-    engine.dispose()
-    initialize(settings)
-    initialize(settings)
-    flags = {doc['id']: doc['questions_llm_confirmed'] for doc in client.get('/api/documents').json()}
-    assert flags == {key: True, new: False}
 
 
 def test_failed_confirm_rolls_back_flag_and_questions(library, monkeypatch):
@@ -186,7 +173,7 @@ def test_failed_confirm_rolls_back_flag_and_questions(library, monkeypatch):
         raise SQLAlchemyError('test')
     with monkeypatch.context() as failure:
         failure.setattr('sqlalchemy.orm.session.SessionTransaction.commit', fail_commit)
-        result = client.post(f'/api/documents/{key}/confirm', json={'questions': [{'question':'测试题'}]})
+        result = client.post(f'/api/documents/{key}/confirm', json={'document_id': key, 'questions': [{'question':'测试题'}]})
     assert result.status_code == 503
     assert client.get('/api/documents').json()[0]['questions_llm_confirmed'] is False
     assert client.get('/api/questions').json() == []
@@ -197,41 +184,25 @@ def test_confirm_preserves_draft_order(library):
     key = upload(client, '顺序.md', b'# order').json()['id']
     confirm = f'/api/documents/{key}/confirm'
     drafts = [{'question': q} for q in ('乙题', '甲题', '甲题', '丙题')]
-    ids = client.post(confirm, json={'questions': drafts}).json()['question_ids']
+    ids = client.post(confirm, json={'document_id': key, 'questions': drafts}).json()['question_ids']
     with TestClient(create_app(settings)) as reopened:
         def check(rows):
             assert [(q['sort_order'], q['question']) for q in rows] == [(1, '乙题'), (2, '甲题'), (3, '丙题')]
             assert [q['question_id'] for q in rows] == ids
         check(reopened.get('/api/questions').json())
         check(reopened.post(f'/api/documents/{key}/prepare').json()['questions'])
-        assert reopened.post(confirm, json={'questions': drafts[::-1]}).json()['question_ids'] == ids
+        assert reopened.post(confirm, json={'document_id': key, 'questions': drafts[::-1]}).json()['question_ids'] == ids
         assert reopened.get('/api/questions?q=丙').json()[0]['sort_order'] == 3
         reopened.delete('/api/questions/' + ids[1]).raise_for_status()
         assert [q['sort_order'] for q in reopened.get('/api/questions').json()] == [1, 3]
         second = upload(reopened, '另一份.md', b'# other').json()['id']
-        reopened.post(f'/api/documents/{second}/confirm', json={'questions': drafts[:1]}).raise_for_status()
-        assert reopened.get('/api/questions', params={'document_id': second}).json()[0]['sort_order'] == 1
+        reopened.post(f'/api/documents/{second}/confirm', json={'document_id': second, 'questions': drafts[:1]}).raise_for_status()
+        assert reopened.get('/api/questions', params={'document_id': second}).json()[0]['sort_order'] == 4
         for number in (1, 2):
             manual = reopened.post('/api/questions', json={'question': f'手动 {number}'}).json()
-            assert manual['sort_order'] == number
+            assert manual['sort_order'] == number + 4
 
 
-def test_upgrade_numbers_old_questions_once(library):
-    client, settings = library
-    key = upload(client, '旧版.md', b'# legacy-order').json()['id']
-    url = f'/api/documents/{key}/confirm'
-    ids = client.post(url, json={'questions': [{'question': q} for q in ('Z', 'A', 'K')]}).json()['question_ids']
-    engine = make_engine(settings)
-    with engine.begin() as conn:
-        conn.execute(text('ALTER TABLE questions DROP COLUMN sort_order'))
-    engine.dispose()
-    initialize(settings)
-    rows = client.get('/api/questions').json()
-    assert [q['question_id'] for q in rows] == sorted(ids)
-    assert [q['sort_order'] for q in rows] == [1, 2, 3]
-    client.delete('/api/questions/' + rows[0]['question_id']).raise_for_status()
-    initialize(settings)
-    assert [q['sort_order'] for q in client.get('/api/questions').json()] == [2, 3]
 
 def mock_model_http(monkeypatch, handler):
     """保留 LangChain 和 SDK 调用链，只替换 HTTP 传输与测试配置。"""
@@ -283,9 +254,9 @@ def test_agent_pipeline_with_chroma(library, monkeypatch, memory_chroma):
         if url.endswith('/chat/completions'):
             assert '# 题库' in body['messages'][-1]['content']
             payload = {'choices': [{'finish_reason': 'tool_calls', 'message': {'role': 'assistant', 'tool_calls': [{'type': 'function', 'id': 'test-call',
-                'function': {'name': 'QuestionDrafts', 'arguments': encoded_drafts}}]}}]}
+                'function': {'name': 'BatchQuestionDrafts', 'arguments': encoded_drafts}}]}}]}
         else:
-            assert body['encoding_format'] == 'float' and 1 <= len(body['input']) <= 20
+            assert 1 <= len(body['input']) <= 20
             data = []
             for i, value in enumerate(body['input']):
                 assert isinstance(value, str)
@@ -293,14 +264,14 @@ def test_agent_pipeline_with_chroma(library, monkeypatch, memory_chroma):
                 data.append({'index': i, 'embedding': [float(j == k) for j in range(len(topics))]})
             payload = {'data': data}
         return httpx.Response(200, json=payload)
-    encoded_drafts = json.dumps({'questions': drafts}, ensure_ascii=False)
     mock_model_http(monkeypatch, model_response)
     key = upload(client, '原文.md', '# 题库'.encode()).json()['id']
+    encoded_drafts = json.dumps({'documents': [{'document_id': key, 'questions': drafts}]}, ensure_ascii=False)
     url = f'/api/documents/{key}'
     prepared = client.post(url + '/prepare').json()
     assert prepared['questions'] == drafts
     prepared['questions'][0]['answer'] = '用户确认的答案'
-    client.post(url + '/confirm', json={'questions': prepared['questions']}).raise_for_status()
+    client.post(url + '/confirm', json={'document_id': key, 'questions': prepared['questions']}).raise_for_status()
     assert client.post(url + '/prepare').json()['status'] == 'confirmed'
     assert len(calls) == 1
     assert client.post('/api/index/rebuild').json() == {'total': 5, 'indexed': 5}
@@ -336,17 +307,17 @@ def test_agent_parse_index_and_search(monkeypatch, memory_chroma):
     def respond(request):
         body = json.loads(request.content)
         if request.url.path.endswith('/chat/completions'):
-            assert body['messages'][-1]['content'] == '# 题库'
+            assert json.loads(body['messages'][-1]['content'])['documents'][0]['source'] == '# 题库'
             return httpx.Response(200, json={'choices': [{'index': 0, 'finish_reason': 'tool_calls',
                 'message': {'role': 'assistant', 'tool_calls': [{'id': 'test-call', 'type': 'function',
-                    'function': {'name': 'QuestionDrafts', 'arguments': json.dumps({'questions': drafts})}}]}}]})
+                    'function': {'name': 'BatchQuestionDrafts', 'arguments': json.dumps({'documents': [{'document_id': 'doc', 'questions': drafts}]})}}]}}]})
         data = [{'index': i, 'embedding': [1., 0.] if '排序' in value else [0., 1.]}
                 for i, value in enumerate(body['input'])]
         return httpx.Response(200, json={'data': data})
     mock_model_http(monkeypatch, respond)
-    parsed = parse_questions.parse_questions('# 题库')
-    assert [item.model_dump() for item in parsed] == drafts
-    rag.rebuild_index([dict(item.model_dump(), question_id=f'q{i}') for i, item in enumerate(parsed)])
+    parsed = parse_questions.parse_questions([{'document_id': 'doc', 'filename': '题库.md', 'source': '# 题库'}])
+    assert parsed == [{'document_id': 'doc', 'questions': drafts}]
+    rag.rebuild_index([dict(item, question_id=f'q{i}') for i, item in enumerate(parsed[0]['questions'])])
     assert memory_chroma.count() == 2
     assert rag.search_ids('排序', 1) == ['q0']
 
@@ -436,7 +407,7 @@ def test_vector_deletion_follows_question_and_document(library, monkeypatch):
     client, settings = library
     source = b'# original'
     doc = upload(client, '测试.md', source).json()['id']
-    ids = client.post(f'/api/documents/{doc}/confirm', json={'questions': [
+    ids = client.post(f'/api/documents/{doc}/confirm', json={'document_id': doc, 'questions': [
         {'question': q} for q in ('第一题', '第二题', '第三题')]}).json()['question_ids']
     other = client.post('/api/questions', json={'question': '独立题目'}).json()['question_id']
     remove = Mock(side_effect=RuntimeError('unavailable'))

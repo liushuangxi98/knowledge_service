@@ -1,8 +1,9 @@
 from contextlib import asynccontextmanager
+from hashlib import sha256
 from pathlib import PureWindowsPath
 
 from fastapi import FastAPI, HTTPException, UploadFile, Query, Response
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import sessionmaker
@@ -11,14 +12,14 @@ from openai import OpenAIError
 from .config import Settings, ROOT
 from .database import make_engine
 from .middleware import BodyLimitMiddleware
-from .schemas import QuestionDrafts, QuestionInput, SearchInput
+from .schemas import BatchQuestionDrafts, DocumentSelection, QuestionDrafts, QuestionInput, QuestionSelection, SearchInput
 from .service import Library
 
 
 def create_app(settings=None):
     settings = settings or Settings()
     engine = make_engine(settings)
-    library = Library(sessionmaker(engine, expire_on_commit=False), settings.originals_dir)
+    library = Library(sessionmaker(engine, expire_on_commit=False), settings.originals_dir, settings.parse_batch_size)
 
     @asynccontextmanager
     async def lifespan(app):
@@ -40,7 +41,12 @@ def create_app(settings=None):
 
     @app.get('/')
     def index():
-        return FileResponse(ROOT / 'frontend' / 'index.html')
+        frontend = ROOT / 'frontend'
+        html = (frontend / 'index.html').read_text(encoding='utf-8')
+        for name in ('app.js', 'styles.css'):
+            version = sha256((frontend / name).read_bytes()).hexdigest()[:16]
+            html = html.replace(f'{name}?v=local', f'{name}?v={version}')
+        return HTMLResponse(html, headers={'Cache-Control': 'no-cache'})
 
     @app.get('/api/documents')
     def documents():
@@ -72,13 +78,23 @@ def create_app(settings=None):
         library.remove_document(key)
         return Response(status_code=204)
 
+    @app.post('/api/documents/prepare-batch')
+    def prepare_batch(body: DocumentSelection):
+        return library.prepare_batch(body.document_ids)
+
     @app.post('/api/documents/{key}/prepare')
     def prepare(key: str):
         return library.prepare(key)
 
+    @app.post('/api/documents/confirm-batch')
+    def confirm_batch(body: BatchQuestionDrafts):
+        return library.confirm_batch(body.documents)
+
     @app.post('/api/documents/{key}/confirm')
     def confirm(key: str, body: QuestionDrafts):
-        return library.confirm(key, body.questions)
+        if body.document_id != key:
+            raise HTTPException(422, '文档 ID 与确认目标不一致')
+        return library.confirm_batch([body])
 
     @app.get('/api/questions')
     def questions(q: str = Query('', max_length=500), document_id: str | None = None):
@@ -91,6 +107,10 @@ def create_app(settings=None):
     @app.put('/api/questions/{key}')
     def edit_question(key: str, body: QuestionInput):
         return library.save_question(body, key)
+
+    @app.post('/api/questions/batch-delete')
+    def remove_questions(body: QuestionSelection):
+        return library.remove_questions(body.question_ids)
 
     @app.delete('/api/questions/{key}', status_code=204)
     def remove_question(key: str):

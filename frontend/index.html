@@ -1,13 +1,15 @@
 <!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>面试知识库</title><link rel="stylesheet" href="/static/styles.css"><script defer src="/static/vendor/markdown-it-15.0.3/markdown-it.umd.min.js"></script><script defer src="/static/app.js"></script></head>
+<title>面试知识库</title><link rel="stylesheet" href="/static/styles.css?v=local"><script defer src="/static/vendor/markdown-it-15.0.3/markdown-it.umd.min.js"></script><script defer src="/static/app.js?v=local"></script></head>
 <body><header class="top"><h1>面试知识库</h1><nav aria-label="主导航"><a href="#documents">原始文档</a><a href="#questions">已确认题目</a><a href="#search">考点检索</a></nav></header>
 <main><p id="status" role="status" hidden></p>
-<section id="documents"><div class="heading"><div><h2>原始文档</h2><p>上传 UTF-8 Markdown 原件，每份最多 16 MiB。</p></div><button id="upload">上传 Markdown</button><input id="file" type="file" accept=".md" hidden></div>
+<section id="documents"><div class="heading"><div><h2>原始文档</h2><p>上传 UTF-8 Markdown 原件，每份最多 16 MiB。</p></div><button id="upload">上传 Markdown</button><input id="file" type="file" accept=".md" multiple hidden></div>
+<div class="actions selection-tools"><label><input type="checkbox" data-all="documents"> 全选文档</label><span id="documents-count">已选 0 份</span><button id="prepare-selected" class="light" disabled>整理所选文档</button></div>
 <div id="docs-list"></div></section>
 <section id="questions"><div class="heading"><h2>已确认题目</h2><div class="actions"><button type="button" id="rebuild" class="light">全量重建向量索引</button><button id="add">手动添加题目</button></div></div>
 <p id="rebuild-status" role="status" hidden></p>
 <form id="filter"><input name="q" type="search" maxlength="500" placeholder="按题干查找" aria-label="按题干查找"><button class="light">查找</button></form>
+<div class="actions selection-tools"><label><input type="checkbox" data-all="questions"> 全选当前结果</label><span id="questions-count">已选 0 道</span><button id="delete-selected" class="light" disabled>删除所选题目</button></div>
 <div id="question-list"></div></section>
 <section id="search"><h2>考点检索</h2><p>输入考点，从已建索引的题目中查找相关内容。</p><form id="search-form"><input name="topic" placeholder="输入考点" aria-label="考点" required><input name="limit" type="number" min="1" max="100" value="5" aria-label="返回数量"><button class="light">检索</button></form><div id="search-result" role="status"></div></section>
 </main><dialog id="editor"><div id="dialog-content"></div><p id="dialog-error" role="alert" hidden></p><button id="close" type="button" class="light">关闭</button></dialog></body></html>
