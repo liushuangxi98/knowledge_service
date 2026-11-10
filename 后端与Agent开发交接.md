@@ -7,7 +7,7 @@
 | 阶段 | 谁提供输入 | 执行逻辑 | 结果交给谁 |
 | --- | --- | --- | --- |
 | 上传 Markdown | 浏览器上传文件 | 已实现，上传阶段没有模型调用 | 原件在磁盘，文档 ID 在 MySQL |
-| 整理草稿 | 后端传入文档 ID 和已解码的原文 | `parse_questions(document_id, source)` | 返回题目列表，前端预览、编辑 |
+| 整理草稿 | 后端传入已解码的原文 | `parse_questions(source)` | 返回题目列表，前端预览、编辑 |
 | 确认入库 | 前端提交用户改好的整批草稿 | 已实现，由后端执行一个 MySQL 事务 | 返回正式 `question_ids`，新题为 `pending` |
 | 建立索引 | 用户点「全量重建向量索引」，后端传入全部正式题目 | 调用百炼、按题目 ID 写 Chroma | 成功的题目标为 `indexed` |
 | 考点检索 | 调用方传入考点和返回数量 | 对考点做向量化，召回 ID，从 MySQL 取回题目和出处 | 知识库通过 HTTP 返回给面试 Agent |
@@ -19,14 +19,14 @@
 在 [knowledge_agent/parse_questions.py](knowledge_agent/parse_questions.py) 中实现这个签名：
 
 ```python
-def parse_questions(document_id: str, source: str) -> list[dict]:
+def parse_questions(source: str) -> list[dict]:
     ...
 ```
 
 点击「整理草稿」会发送 `POST /api/documents/{id}/prepare`。后端的 `Library.prepare()` 先查看该文档的 `questions_llm_confirmed`：
 
 - **True**：直接从 MySQL 取这份文档现存的正式题目，返回 `status="confirmed"`。哪怕五道题全部是 `pending`，拆题函数也不会被调用。用户后来删光了题目，会得到空的已确认列表。
-- **False**：后端读取原件，以 UTF-8 解码（兼容 BOM），执行 `parse_questions(document_id, source)`。它会逐条用 `QuestionInput` 校验返回值，再以 `status="draft"` 交给前端。Agent 直接使用 SDK 响应，调用失败时向上抛出原始异常。
+- **False**：后端读取原件，以 UTF-8 解码（兼容 BOM），执行 `parse_questions(source)`。它会逐条用 `QuestionInput` 校验返回值，再以 `status="draft"` 交给前端。Agent 直接使用 SDK 响应，调用失败时向上抛出原始异常。
 
 **函数内部只需要处理原文。** 从 `source` 找出题目边界，提取题干、原文答案和原文位置，补上知识点标签。使用 LLM 时，可以把这些要求写进提示词，用一个含 `questions: list[QuestionInput]` 的结构化结果接收输出，最后返回其中的题目列表。后端当前直接同步调用这个函数，因此这里使用普通 `def`。如模型调用失败，要让调用方看到错误；空列表只用于确实没有提取到题目的情况。
 

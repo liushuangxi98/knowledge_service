@@ -145,7 +145,7 @@ def test_prepare_reuses_confirmed_questions_after_restart(library, monkeypatch):
     monkeypatch.setattr(parse_questions, 'parse_questions', parser, raising=False)
     prepared = client.post(url + '/prepare').json()
     assert prepared['status'] == 'draft' and len(prepared['questions']) == 5
-    parser.assert_called_once_with(key, '# 面试')
+    parser.assert_called_once_with('# 面试')
     assert client.get('/api/documents').json()[0]['questions_llm_confirmed'] is False
     ids = client.post(url + '/confirm', json={'questions': drafts}).json()['question_ids']
     with TestClient(create_app(settings)) as reopened:

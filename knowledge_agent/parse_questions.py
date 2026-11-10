@@ -1,4 +1,4 @@
-"""从 Markdown 原文拆题。输入文档 ID 和原文，输出题干、原文答案、知识点及题号或章节位置的草稿列表，交给用户核对。"""
+"""从 Markdown 原文拆题。输入原文，输出题干、原文答案、知识点及题号或章节位置的草稿列表，交给用户核对。"""
 from langchain_openai import ChatOpenAI
 from pydantic import BaseModel
 
@@ -17,7 +17,7 @@ def build_llm():
     )
 
 
-def parse_questions(document_id: str, source: str):
+def parse_questions(source: str):
     # 输入
     contexts = [
         {'role': 'system', 'content': '你在负责企业面试知识库搭建，你需要从给出的文档资料中提取出面试题和答案和知识点和所处文档位置，按我要求的模型类返回。'

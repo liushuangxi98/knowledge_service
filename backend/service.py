@@ -130,7 +130,7 @@ class Library:
                 return {'status': 'confirmed', 'questions': [show_question(row) for row in rows]}
 
         source = self.original(key).decode('utf-8-sig')
-        drafts = parse_questions.parse_questions(key, source)
+        drafts = parse_questions.parse_questions(source)
         return {'status': 'draft', 'questions': [QuestionInput.model_validate(item).model_dump() for item in drafts]}
 
     def confirm(self, key, drafts):
