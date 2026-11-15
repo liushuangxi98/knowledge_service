@@ -23,12 +23,12 @@ def library(tmp_path, monkeypatch):
     if not os.environ.get('KNOWLEDGE_TEST_MYSQL_PORT'):
         pytest.skip('请指定隔离实例的 KNOWLEDGE_TEST_MYSQL_PORT 和 KNOWLEDGE_TEST_MYSQL_PASSWORD')
     database = 'knowledge_test_' + uuid4().hex
-    settings = Settings(_env_file=None, mysql_host='127.0.0.1', mysql_user='root', mysql_database=database,
+    settings = Settings(_env_file=None, knowledge_api_key='test-knowledge-key', mysql_host='127.0.0.1', mysql_user='root', mysql_database=database,
                         mysql_port=int(os.environ['KNOWLEDGE_TEST_MYSQL_PORT']),
                         mysql_password=os.environ['KNOWLEDGE_TEST_MYSQL_PASSWORD'], originals_dir=tmp_path)
     initialize(settings)
     try:
-        with TestClient(create_app(settings)) as client:
+        with TestClient(create_app(settings), headers={'X-API-Key': 'test-knowledge-key'}) as client:
             yield client, settings
     finally:
         admin = make_engine(settings, admin=True)
@@ -85,7 +85,7 @@ def test_document_confirm_and_index_state(library):
 
 
 def test_upload_limits_and_search(library, monkeypatch):
-    monkeypatch.setattr("knowledge_agent.rag.search_ids", lambda topic, limit: [])
+    monkeypatch.setattr("knowledge_agent.rag.search_ids", lambda topic, limit, distance_limit=None: [])
     client, _ = library
     for name, data in [('错.txt', b'x'), ('空.md', b' \n'), ('坏.md', b'\xff')]:
         assert upload(client, name, data).status_code == 422
@@ -320,7 +320,7 @@ def test_agent_parse_index_and_search(monkeypatch, memory_chroma):
     assert parsed['documents'] == [{'document_id': 'doc', 'questions': drafts}]
     rag.rebuild_index([dict(item, question_id=f'q{i}') for i, item in enumerate(parsed['documents'][0]['questions'])])
     assert memory_chroma.count() == 2
-    assert rag.search_ids('排序', 1) == ['q0']
+    assert rag.search_ids('排序', 1) == {'q0': pytest.approx(0)}
 
 
 def test_rebuild_updates_existing_vectors(monkeypatch, memory_chroma):
@@ -391,14 +391,15 @@ def test_search_with_two_arguments_filters_stale_hits_in_rank_order(library, mon
             session.get(Question, key).index_status = 'indexed'
     engine.dispose()
 
-    def search_ids(topic, limit):
-        assert (topic, limit) == ('测试考点', 4)
-        return [ids[1], 'deleted-id', ids[2], ids[0]]
+    def search_ids(topic, limit, distance_limit=None):
+        assert (topic, limit, distance_limit) == ('测试考点', 4, None)
+        return {ids[1]: 0.1, 'deleted-id': 0.2, ids[2]: 0.3, ids[0]: 0.4}
 
     monkeypatch.setattr(rag, 'search_ids', search_ids)
     response = client.post('/api/search', json={'topic': '测试考点', 'limit': 4})
     assert response.status_code == 200
     assert [item['question_id'] for item in response.json()['items']] == [ids[1], ids[0]]
+    assert [item['distance'] for item in response.json()['items']] == [0.1, 0.4]
 
 
 def test_vector_deletion_follows_question_and_document(library, monkeypatch):

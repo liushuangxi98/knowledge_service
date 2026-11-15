@@ -254,15 +254,16 @@ class Library:
         finally:
             self.index_lock.release()
 
-    def search(self, topic, limit):
+    def search(self, topic, limit, distance_limit=None):
         # 按考点召回，再按原排名返回仍有效的题目和最新答案。
-        ids = rag.search_ids(topic, limit)
+        ids = rag.search_ids(topic, limit, distance_limit)
         if not ids:
             return {'items': []}
         with self.sessions() as session:
             rows = session.scalars(select(Question).where(Question.question_id.in_(ids), Question.index_status == 'indexed'))
             by_id = {q.question_id: show_question(q) for q in rows}
-        return {'items': [by_id[key] for key in ids if key in by_id]}
+        # 将向量距离附在每道有效原题上，方便调用方查看和调整阈值。
+        return {'items': [dict(by_id[key], distance=distance) for key, distance in ids.items() if key in by_id]}
 
     def remove_question(self, key):
         self.remove_questions([key])

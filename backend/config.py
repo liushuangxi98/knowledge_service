@@ -14,6 +14,8 @@ class Settings(BaseSettings):
     mysql_password: SecretStr = SecretStr('')
     mysql_database: str = Field(default='knowledge_service', pattern=r'^[A-Za-z][A-Za-z0-9_]{0,63}$')
     originals_dir: Path = ROOT / 'data' / 'originals'
+    # 只供本机工作台检索使用，两端配置相同密钥。
+    knowledge_api_key: SecretStr = Field(default=SecretStr(''), repr=False)
     chroma_url: str = 'http://127.0.0.1:8100'
     chroma_dir: Path = ROOT / 'data' / 'chroma'
 

@@ -1,11 +1,13 @@
 from contextlib import asynccontextmanager
 from hashlib import sha256
+from secrets import compare_digest
 from pathlib import PureWindowsPath
 
-from fastapi import FastAPI, HTTPException, UploadFile, Query, Response
+from fastapi import Depends, FastAPI, HTTPException, UploadFile, Query, Response
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
+from fastapi.security import APIKeyHeader
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import sessionmaker
 
@@ -124,8 +126,18 @@ def create_app(settings=None):
     def rebuild_index():
         return library.rebuild_index()
 
+    # 读取请求头，密钥内容由下面的路由显式核对。
+    key_header = APIKeyHeader(name='X-API-Key', auto_error=False)
+
     @app.post('/api/search')
-    def search(body: SearchInput):
-        return library.search(body.topic, body.limit)
+    def search(body: SearchInput, key: str | None = Depends(key_header)):
+        expected = settings.knowledge_api_key.get_secret_value().strip()
+        # 未配置时关闭检索，避免空密钥被误认为有效配置。
+        if not expected:
+            raise HTTPException(503, '知识库尚未配置 KNOWLEDGE_API_KEY')
+        # 比较完整内容，通过后才进行向量化、召回和数据库读取。
+        if not compare_digest((key or '').encode(), expected.encode()):
+            raise HTTPException(401, '知识库检索密钥无效')
+        return library.search(body.topic, body.limit, body.distance_limit)
 
     return app

@@ -76,6 +76,7 @@ function syncSelection(kind) {
   all.indeterminate = count > 0 && count < nodes.length;
   $('#' + kind + '-count').textContent = `已选 ${count} ${kind === 'documents' ? '份' : '道'}`;
   $(kind === 'documents' ? '#prepare-selected' : '#delete-selected').disabled = !count || (kind === 'documents' && parsing);
+  if (kind === 'documents') $('#delete-selected-documents').disabled = !count || parsing;
 }
 function confirmButton() {
   const pending = batch.filter(doc => doc.status === 'draft');
@@ -225,6 +226,32 @@ $('#file').onchange = async event => {
   } finally { $('#upload').disabled = false; }
 };
 $('#prepare-selected').onclick = () => prepareDocuments(selected('documents')).catch(error => status(error.message, true));
+$('#delete-selected-documents').onclick = async () => {
+  // 固定确认时勾选的文档 ID，全选也使用同一份列表。
+  const ids = selected('documents');
+  if (!ids.length || !confirm(`删除所选 ${ids.length} 份 Markdown 原件、草稿、所属题目和对应向量？`)) return;
+  $('#documents').inert = true;
+  let deleted = 0, failure = '';
+  try {
+    // 沿用单文档删除接口，逐份等待成功；某份失败就停止发送后续请求。
+    for (const id of ids) {
+      await api('/documents/' + encodeURIComponent(id), 'DELETE');
+      deleted++;
+    }
+  } catch (error) {
+    failure = error.message;
+  }
+  // 部分成功时也重新读取列表，按服务端结果显示剩余文档和题目。
+  try {
+    await refresh();
+  } catch (error) {
+    failure = [failure, '列表刷新失败：' + error.message].filter(Boolean).join('；');
+  } finally {
+    $('#documents').inert = false;
+  }
+  if (deleted) $('#search-result').replaceChildren();
+  status(failure ? `已确认删除 ${deleted} / ${ids.length} 份文档。${failure}` : `已删除 ${deleted} 份文档。`, !!failure);
+};
 $('#delete-selected').onclick = async event => {
   const ids = selected('questions');
   if (!ids.length || !confirm(`删除所选 ${ids.length} 道题及对应向量？原文档保留。`)) return;
