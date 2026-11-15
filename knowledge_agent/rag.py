@@ -55,7 +55,7 @@ def del_index(questions):
     if existing_ids:
         chroma_store.delete(list(existing_ids))
 
-def search_ids(topic: str, limit: int):
+def search_ids(topic: str, limit: int, distance_limit: float | None = None):
     settings = Settings()
     # 向量库
     chroma_database_version = settings.get_chroma_database_version()
@@ -67,4 +67,5 @@ def search_ids(topic: str, limit: int):
     )
 
     matches = chroma_store.similarity_search_with_score(topic, k=limit)
-    return [doc.id for doc, _ in matches]
+    # 余弦距离越小越相关；等于阈值也保留。未传阈值时按原召回结果返回。
+    return {doc.id: distance for doc, distance in matches if distance_limit is None or distance <= distance_limit}
